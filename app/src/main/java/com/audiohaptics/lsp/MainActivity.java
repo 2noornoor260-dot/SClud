@@ -60,12 +60,11 @@ public class MainActivity extends Activity {
         addTest(root, "Click", VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK));
         addTest(root, "Heavy click", VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK));
         addTest(root, "Double click", VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK));
-        addTest(root, "Thud", VibrationEffect.createPredefined(VibrationEffect.EFFECT_THUD));
+        addTestThud(root);
         addTest(root, "Buzz 800ms", VibrationEffect.createOneShot(800, 255));
         addTest(root, "Composition", VibrationEffect.startComposition()
                 .addPrimitive(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE, 0.8f)
                 .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 1f, 40)
-                .addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD, 0.9f, 60)
                 .addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, 0.7f, 60).compose());
 
         EditText et = new EditText(this);
@@ -157,6 +156,24 @@ public class MainActivity extends Activity {
         bt.setText(label);
         bt.setAllCaps(false);
         bt.setOnClickListener(v -> { if (vib != null) vib.vibrate(fx); });
+        root.addView(bt);
+    }
+
+    // EFFECT_THUD is a @hide API — access via reflection at runtime
+    void addTestThud(LinearLayout root) {
+        Button bt = new Button(this);
+        bt.setText("Thud");
+        bt.setAllCaps(false);
+        bt.setOnClickListener(v -> {
+            if (vib == null) return;
+            try {
+                int effectId = (int) VibrationEffect.class.getField("EFFECT_THUD").get(null);
+                vib.vibrate(VibrationEffect.createPredefined(effectId));
+            } catch (Throwable e) {
+                // Fallback: heavy click if EFFECT_THUD not available on this device
+                vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK));
+            }
+        });
         root.addView(bt);
     }
 }
