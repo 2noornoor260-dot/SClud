@@ -3,12 +3,17 @@ package com.audiohaptics.lsp;
 import android.content.Context;
 import android.provider.Settings;
 
-/** Settings written by the UI app into Settings.Global ("g=1.00;t=1.00;w=1"). */
+/** Settings written by the UI app into Settings.Global ("e=1;m=1;p=1;k=0;g=1.00;t=1.00;s=0.60;w=1"). */
 final class Config {
     static final String KEY = "audio_haptics_cfg";
-    volatile float gain = 1.0f;   // master strength
-    volatile float tone = 1.0f;   // carrier frequency multiplier
-    volatile int warm = 1;        // 0 = on demand, 1 = while screen is on, 2 = always
+    volatile boolean enabled = true;      // e: master switch
+    volatile boolean muteOnSilent = true; // m: no haptics while the ringer is on silent
+    volatile int phase = 1;               // p: 0 = in-phase (strong), 1 = anti-phase (quiet, dipole cancellation)
+    volatile int src = 0;                 // k: 0 = auto, 1 = fixed-volume speaker (BEACON), 2 = alarm stream
+    volatile float gain = 1.0f;           // g: strength (own control, 0..3)
+    volatile float tone = 1.0f;           // t: carrier frequency multiplier
+    volatile float soft = 0.6f;           // s: softness (low-pass), 0..1
+    volatile int warm = 1;                // w: 0 on demand, 1 while screen on, 2 always
 
     void refresh(Context c) {
         if (c == null) return;
@@ -19,8 +24,13 @@ final class Config {
                 String[] p = kv.split("=");
                 if (p.length != 2) continue;
                 switch (p[0]) {
-                    case "g": gain = clamp(Float.parseFloat(p[1]), 0f, 2.5f); break;
+                    case "e": enabled = !p[1].equals("0"); break;
+                    case "m": muteOnSilent = !p[1].equals("0"); break;
+                    case "p": phase = Math.max(0, Math.min(1, Integer.parseInt(p[1]))); break;
+                    case "k": src = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
+                    case "g": gain = clamp(Float.parseFloat(p[1]), 0f, 3f); break;
                     case "t": tone = clamp(Float.parseFloat(p[1]), 0.5f, 2f); break;
+                    case "s": soft = clamp(Float.parseFloat(p[1]), 0f, 1f); break;
                     case "w": warm = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
                 }
             }

@@ -1,6 +1,7 @@
 package com.audiohaptics.lsp;
 
 import android.app.Activity;
+import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -14,15 +15,19 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Switch;
 import android.widget.TextView;
 
 import java.util.Locale;
 
 public class MainActivity extends Activity {
-    float gain = 1f, tone = 1f;
-    int warm = 1;
-    TextView status, hint, gainLabel, toneLabel, report;
+    boolean enabled = true, muteOnSilent = true;
+    int phase = 1, src = 0, warm = 1;
+    float gain = 1f, tone = 1f, soft = 0.6f;
+    TextView status, report, hint, gainLabel, toneLabel, softLabel;
     Vibrator vib;
+
+    interface OnVal { void on(int v); }
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -37,25 +42,30 @@ public class MainActivity extends Activity {
         setContentView(sv);
 
         status = text(root, "", 16);
-        report = text(root, "", 12);
-        report.setTypeface(android.graphics.Typeface.MONOSPACE);
+        report = text(root, "", 11);
+        report.setTypeface(Typeface.MONOSPACE);
+
+        addSwitch(root, "تشغيل الاهتزاز عبر السماعات (الزر الرئيسي)", enabled, on -> { enabled = on; save(); });
+        addSwitch(root, "إيقاف الاهتزاز عند الوضع الصامت", muteOnSilent, on -> { muteOnSilent = on; save(); });
+
         gainLabel = text(root, "", 14);
-        root.addView(seek(20, 250, (int) (gain * 100), v -> { gain = v / 100f; save(); refreshLabels(); }));
+        root.addView(seek(0, 300, (int) (gain * 100), v -> { gain = v / 100f; save(); refreshLabels(); }));
         toneLabel = text(root, "", 14);
         root.addView(seek(50, 200, (int) (tone * 100), v -> { tone = v / 100f; save(); refreshLabels(); }));
+        softLabel = text(root, "", 14);
+        root.addView(seek(0, 100, (int) (soft * 100), v -> { soft = v / 100f; save(); refreshLabels(); }));
+
+        text(root, "طور السماعات:", 14);
+        radios(root, new String[]{"هادئ: طور معاكس (صوت أقل، موصى به)", "قوي: طور متطابق (أقوى وأعلى صوتاً)"},
+                phase, v -> { phase = v; save(); });
+
+        text(root, "مصدر الصوت:", 14);
+        radios(root, new String[]{"تلقائي", "ثابت (BEACON): قوة مستقلة عن أي مستوى صوت", "المنبّه (يتبع مستوى صوت المنبّه)"},
+                src, v -> { src = v; save(); });
 
         text(root, "إبقاء مسار الصوت جاهزاً (أقل تأخير):", 14);
-        RadioGroup rg = new RadioGroup(this);
-        String[] names = {"عند الطلب فقط (تأخير أول نقرة ~100ms)", "أثناء تشغيل الشاشة (موصى به)", "دائماً"};
-        for (int i = 0; i < 3; i++) {
-            RadioButton r = new RadioButton(this);
-            r.setText(names[i]);
-            r.setId(100 + i);
-            rg.addView(r);
-        }
-        rg.check(100 + warm);
-        rg.setOnCheckedChangeListener((g, id) -> { warm = id - 100; save(); });
-        root.addView(rg);
+        radios(root, new String[]{"عند الطلب فقط (تأخير أول نقرة ~100ms)", "أثناء تشغيل الشاشة (موصى به)", "دائماً"},
+                warm, v -> { warm = v; save(); });
 
         text(root, "اختبار:", 14);
         addTest(root, "Tick", VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));
@@ -93,17 +103,16 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         boolean has = vib != null && vib.hasVibrator();
-        status.setText(has ? "✔ النظام يرى الآن هزازاً (الوحدة تعمل)"
-                : "✘ لا يوجد هزاز بعد");
+        status.setText(has ? "✔ النظام يرى الآن هزازاً (الوحدة تعمل)" : "✘ لا يوجد هزاز بعد");
         String r = null;
         try { r = Settings.Global.getString(getContentResolver(), Status.KEY); } catch (Throwable ignored) { }
-        report.setText(r != null ? "تقرير system_server:\n" + r
-                : "تقرير system_server: (لا يوجد)\nالوحدة لم تعمل داخل system_server: تأكد أنها مفعّلة في LSPosed وأن «System Framework» مُحدَّد في نطاقها، ثم أعد التشغيل.");
+        report.setText(r != null ? "تقرير system_server:\n" + r : "تقرير system_server: (لا يوجد)");
     }
 
     void refreshLabels() {
-        gainLabel.setText(String.format(Locale.US, "القوة العامة: %d%%", (int) (gain * 100)));
+        gainLabel.setText(String.format(Locale.US, "القوة (مستقلة): %d%%", (int) (gain * 100)));
         toneLabel.setText(String.format(Locale.US, "حدّة النغمة (التردد): %d%%", (int) (tone * 100)));
+        softLabel.setText(String.format(Locale.US, "النعومة (تقليل الصوت الحاد): %d%%", (int) (soft * 100)));
     }
 
     void load() {
@@ -113,17 +122,25 @@ public class MainActivity extends Activity {
             for (String kv : s.split(";")) {
                 String[] p = kv.split("=");
                 if (p.length != 2) continue;
-                if (p[0].equals("g")) gain = Float.parseFloat(p[1]);
-                else if (p[0].equals("t")) tone = Float.parseFloat(p[1]);
-                else if (p[0].equals("w")) warm = Integer.parseInt(p[1]);
+                switch (p[0]) {
+                    case "e": enabled = !p[1].equals("0"); break;
+                    case "m": muteOnSilent = !p[1].equals("0"); break;
+                    case "p": phase = Integer.parseInt(p[1]); break;
+                    case "k": src = Integer.parseInt(p[1]); break;
+                    case "g": gain = Float.parseFloat(p[1]); break;
+                    case "t": tone = Float.parseFloat(p[1]); break;
+                    case "s": soft = Float.parseFloat(p[1]); break;
+                    case "w": warm = Integer.parseInt(p[1]); break;
+                }
             }
         } catch (Throwable ignored) { }
     }
 
     void save() {
         try {
-            Settings.Global.putString(getContentResolver(), Config.KEY,
-                    String.format(Locale.US, "g=%.2f;t=%.2f;w=%d", gain, tone, warm));
+            Settings.Global.putString(getContentResolver(), Config.KEY, String.format(Locale.US,
+                    "e=%d;m=%d;p=%d;k=%d;g=%.2f;t=%.2f;s=%.2f;w=%d",
+                    enabled ? 1 : 0, muteOnSilent ? 1 : 0, phase, src, gain, tone, soft, warm));
             if (hint != null) hint.setVisibility(View.GONE);
         } catch (SecurityException e) {
             if (hint != null) {
@@ -134,12 +151,35 @@ public class MainActivity extends Activity {
         }
     }
 
-    interface OnVal { void on(int v); }
+    interface OnBool { void on(boolean v); }
+
+    void addSwitch(LinearLayout root, String label, boolean init, OnBool cb) {
+        Switch sw = new Switch(this);
+        sw.setText(label);
+        sw.setChecked(init);
+        sw.setPadding(0, 16, 0, 16);
+        sw.setOnCheckedChangeListener((b, on) -> cb.on(on));
+        root.addView(sw);
+    }
+
+    void radios(LinearLayout root, String[] names, int sel, OnVal cb) {
+        RadioGroup rg = new RadioGroup(this);
+        for (String n : names) {
+            RadioButton r = new RadioButton(this);
+            r.setText(n);
+            r.setId(View.generateViewId());
+            rg.addView(r);
+        }
+        if (sel >= 0 && sel < names.length) ((RadioButton) rg.getChildAt(sel)).setChecked(true);
+        rg.setOnCheckedChangeListener((g, id) -> cb.on(g.indexOfChild(g.findViewById(id))));
+        root.addView(rg);
+    }
 
     SeekBar seek(int min, int max, int cur, OnVal cb) {
         SeekBar s = new SeekBar(this);
+        s.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);   // left = min, right = max
         s.setMax(max - min);
-        s.setProgress(cur - min);
+        s.setProgress(Math.max(0, Math.min(max - min, cur - min)));
         s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar sb, int v, boolean user) { if (user) cb.on(v + min); }
             @Override public void onStartTrackingTouch(SeekBar sb) { }

@@ -5,7 +5,7 @@ import java.util.HashMap;
 /** Waveform recipes. Short enveloped sine bursts around the speaker's usable low end + a tiny transient "snap". */
 final class Synth {
     static final int SR = 48000;
-    static final float BUZZ_HZ = 165f;
+    static final float BUZZ_HZ = 140f;
 
     static final int[] SUPPORTED_EFFECTS = {0, 1, 2, 3, 4, 5, 21};   // CLICK DOUBLE TICK THUD POP HEAVY TEXTURE_TICK
     static final int[] PRIMITIVES = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -39,17 +39,17 @@ final class Synth {
 
     private static float[] build(int id, float t) {
         switch (id) {
-            case 0: case 101: return burst(175 * t, 175 * t, 28, 1.0f, 7f, 3f, 0.85f, 0.20f);
-            case 2: case 107: return burst(260 * t, 260 * t, 14, 0.6f, 3.5f, 2f, 0.50f, 0.15f);
-            case 3: case 102: return burst(120 * t, 110 * t, 60, 2.0f, 18f, 6f, 1.00f, 0.08f);
-            case 4: return burst(230 * t, 200 * t, 22, 0.8f, 5f, 3f, 0.70f, 0.25f);
-            case 5: return burst(150 * t, 140 * t, 40, 1.2f, 11f, 5f, 1.00f, 0.25f);
-            case 21: return burst(300 * t, 300 * t, 9, 0.5f, 2.2f, 1.5f, 0.30f, 0.08f);
-            case 103: return burst(90 * t, 170 * t, 45, 4f, 0f, 8f, 0.80f, 0f);
-            case 104: return burst(170 * t, 200 * t, 50, 44f, 0f, 4f, 0.80f, 0f);
-            case 105: return burst(160 * t, 200 * t, 120, 110f, 0f, 8f, 0.85f, 0f);
-            case 106: return burst(200 * t, 150 * t, 35, 1f, 12f, 4f, 0.80f, 0.10f);
-            case 108: return burst(180 * t, 170 * t, 22, 0.8f, 6f, 3f, 0.45f, 0.10f);
+            case 0: case 101: return burst(150 * t, 150 * t, 30, 1.5f, 8f, 4f, 0.85f, 0f);
+            case 2: case 107: return burst(210 * t, 210 * t, 16, 1.0f, 4f, 3f, 0.50f, 0f);
+            case 3: case 102: return burst(100 * t, 90 * t, 65, 2.5f, 20f, 8f, 1.00f, 0f);
+            case 4: return burst(185 * t, 165 * t, 24, 1.2f, 6f, 4f, 0.70f, 0f);
+            case 5: return burst(125 * t, 115 * t, 44, 1.5f, 12f, 6f, 1.00f, 0f);
+            case 21: return burst(240 * t, 240 * t, 11, 0.8f, 2.5f, 2.5f, 0.30f, 0f);
+            case 103: return burst(80 * t, 140 * t, 45, 4f, 0f, 8f, 0.80f, 0f);
+            case 104: return burst(140 * t, 170 * t, 50, 44f, 0f, 4f, 0.80f, 0f);
+            case 105: return burst(130 * t, 170 * t, 120, 110f, 0f, 8f, 0.85f, 0f);
+            case 106: return burst(170 * t, 125 * t, 35, 1.5f, 12f, 4f, 0.80f, 0f);
+            case 108: return burst(150 * t, 140 * t, 22, 1.2f, 6f, 4f, 0.45f, 0f);
             default: return new float[0];
         }
     }
@@ -80,11 +80,10 @@ final class Synth {
         return o;
     }
 
-    /** Soft limiter (protects the speakers) and float -> PCM16. */
-    static short toPcm(float x) {
-        float a = Math.abs(x), y;
-        y = a < 0.7f ? a : 0.7f + 0.3f * (float) Math.tanh((a - 0.7f) / 0.3f);
+    /** Soft limiter (protects the speakers). */
+    static float limit(float x) {
+        float a = Math.abs(x), y = a < 0.7f ? a : 0.7f + 0.3f * (float) Math.tanh((a - 0.7f) / 0.3f);
         y *= 0.97f;
-        return (short) ((x < 0 ? -y : y) * 32767f);
+        return x < 0 ? -y : y;
     }
 }
