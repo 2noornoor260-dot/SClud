@@ -66,6 +66,10 @@ final class HapticEngine implements Runnable {
     private float[] mix = new float[240];
     private short[] pcm = new short[480];
     private String trackInfo = "not created", lastState = "";
+    private volatile long lastPump = System.nanoTime();
+    private volatile float comp = 1f;          // keeps strength constant when the ALARM source is used
+    private int usedSrc, stalls;
+    private long lastAlive;
 
     HapticEngine(StateListener l) {
         listener = l;
@@ -81,6 +85,7 @@ final class HapticEngine implements Runnable {
         thread = new Thread(this, "AudioHaptics-engine");
         thread.setDaemon(true);
         thread.start();
+        cb.postDelayed(watchdog, 2000);
         Status.put("5.engine", "thread started");
     }
 
@@ -135,6 +140,34 @@ final class HapticEngine implements Runnable {
     }
 
     // ------------------------------------------------------------------ internals
+
+    /** If the engine stops consuming audio (blocked write), releasing the track from here unblocks and re-inits it. */
+    private final Runnable watchdog = new Runnable() {
+        @Override public void run() {
+            try {
+                AudioTrack t = track;
+                if (started && t != null && playing && System.nanoTime() - lastPump > 2_500_000_000L) {
+                    stalls++;
+                    Status.put("9.watchdog", "engine stalled -> track released (count=" + stalls + ")");
+                    try { t.release(); } catch (Throwable ignored) { }
+                    lastPump = System.nanoTime();
+                }
+            } catch (Throwable ignored) { }
+            cb.postDelayed(this, 1000);
+        }
+    };
+
+    private void updateComp(Context c) {
+        if (usedSrc != SRC_ALARM) { comp = 1f; return; }
+        try {
+            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+            int idx = am.getStreamVolume(AudioManager.STREAM_ALARM);
+            int max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+            float cur = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, idx, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
+            float top = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, max, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
+            comp = Config.clamp((float) Math.pow(10, (top - cur) / 20.0), 1f, 4f);
+        } catch (Throwable e) { comp = 1f; }
+    }
 
     private boolean enabledNow() { return cfg.enabled && !(cfg.muteOnSilent && silent); }
 
@@ -217,7 +250,16 @@ final class HapticEngine implements Runnable {
         while (started) {
             try {
                 long now = System.nanoTime();
-                if (now - lastCfg > 1_000_000_000L) { cfg.refresh(ctx()); lastCfg = now; reportState(); }
+                if (now - lastCfg > 1_000_000_000L) {
+                    cfg.refresh(ctx()); lastCfg = now; reportState();
+                    if (ctx != null && track != null) updateComp(ctx);
+                    if (now - lastAlive > 5_000_000_000L) {
+                        lastAlive = now;
+                        Status.put("9.alive", new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(new java.util.Date())
+                                + " comp=" + String.format(java.util.Locale.US, "%.2f", comp));
+                    }
+                }
+                lastPump = Math.max(lastPump, now - 1_000_000_000L);
                 if (!enabledNow()) {
                     inbox.clear(); voices.clear(); susEnd = 0; susCur = 0;
                     if (playing) stopTrack();
@@ -269,16 +311,20 @@ final class HapticEngine implements Runnable {
         return null;
     }
 
-    /** Plays a few bursts of silence and checks the stream is really routed and consumed. */
+    /** Starts the track with silence (non-blocking) and waits up to ~700 ms for a routed device / consumed frames. */
     private boolean verify(AudioTrack t) {
         try {
             short[] z = new short[burst * 2];
-            t.write(z, 0, z.length, AudioTrack.WRITE_BLOCKING);
+            t.write(z, 0, z.length, AudioTrack.WRITE_NON_BLOCKING);
             t.play();
-            for (int i = 0; i < 8; i++) t.write(z, 0, z.length, AudioTrack.WRITE_BLOCKING);
-            Thread.sleep(90);
-            boolean ok = t.getPlayState() == AudioTrack.PLAYSTATE_PLAYING && t.getPlaybackHeadPosition() > 0;
-            AudioDeviceInfo d = t.getRoutedDevice();
+            boolean ok = false;
+            AudioDeviceInfo d = null;
+            for (int i = 0; i < 14 && !ok; i++) {
+                Thread.sleep(50);
+                t.write(z, 0, z.length, AudioTrack.WRITE_NON_BLOCKING);
+                d = t.getRoutedDevice();
+                ok = d != null || t.getPlaybackHeadPosition() > 0;
+            }
             trackInfo = "routed=" + (d == null ? "none" : "type" + d.getType());
             t.pause();
             t.flush();
@@ -310,9 +356,11 @@ final class HapticEngine implements Runnable {
         for (int s : order) {
             AudioTrack x = build(s, fmt, capBytes);
             if (x == null) { Status.put("6.audio.src" + s, "track creation failed"); continue; }
-            if (verify(x)) { t = x; used = s; break; }
-            Status.put("6.audio.src" + s, "not routed/consumed -> skipped");
+            boolean ok = verify(x);
+            if (ok || s == SRC_ALARM) { t = x; used = s; break; }
+            Status.put("6.audio.src" + s, "not routed after 700ms -> skipped");
             x.release();
+            try { Thread.sleep(250); } catch (InterruptedException ignored) { }
         }
         if (t == null) return false;
         try {
@@ -324,7 +372,11 @@ final class HapticEngine implements Runnable {
         t.setBufferSizeInFrames(bufFrames);
         lastUnder = 0;
         track = t;
+        usedSrc = used;
         appliedSrc = want;
+        Status.remove("6.audio.src1");
+        Status.remove("6.audio.src2");
+        lastPump = System.nanoTime();
         trackInfo = "src=" + (used == SRC_BEACON ? "BEACON(fixed volume)" : "ALARM") + " perfMode=" + t.getPerformanceMode()
                 + " " + trackInfo;
         Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
@@ -385,7 +437,7 @@ final class HapticEngine implements Runnable {
         // softness: 2-pole low-pass, cutoff 1500 Hz (soft=0) .. 250 Hz (soft=1)
         double fc = 1500.0 * Math.pow(250.0 / 1500.0, cfg.soft);
         float alpha = (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
-        float g = cfg.gain * REF;
+        float g = cfg.gain * REF * comp;
         boolean anti = cfg.phase == 1;
         for (int i = 0; i < n; i++) {
             lp1 += alpha * (mix[i] * g - lp1);
@@ -397,6 +449,7 @@ final class HapticEngine implements Runnable {
         int w = track.write(pcm, 0, n * 2, AudioTrack.WRITE_BLOCKING);
         if (w < 0) throw new IllegalStateException("AudioTrack.write=" + w);
         framesWritten += w / 2;
+        lastPump = System.nanoTime();
 
         long now = System.nanoTime();
         if (now - lastTune > 500_000_000L) {

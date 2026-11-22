@@ -30,6 +30,10 @@ final class Status {
         if (bootDone) ex.execute(Status::flush);
     }
 
+    static synchronized void remove(String k) {
+        if (map.remove(k) != null && bootDone) ex.execute(Status::flush);
+    }
+
     static void bootCompleted() {
         bootDone = true;
         ex.execute(Status::flush);

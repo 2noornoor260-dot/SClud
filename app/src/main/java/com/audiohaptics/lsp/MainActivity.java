@@ -15,7 +15,6 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
-import android.widget.Switch;
 import android.widget.TextView;
 
 import java.util.Locale;
@@ -45,8 +44,8 @@ public class MainActivity extends Activity {
         report = text(root, "", 11);
         report.setTypeface(Typeface.MONOSPACE);
 
-        addSwitch(root, "تشغيل الاهتزاز عبر السماعات (الزر الرئيسي)", enabled, on -> { enabled = on; save(); });
-        addSwitch(root, "إيقاف الاهتزاز عند الوضع الصامت", muteOnSilent, on -> { muteOnSilent = on; save(); });
+        addToggle(root, "الاهتزاز عبر السماعات (الزر الرئيسي)", enabled, on -> { enabled = on; save(); });
+        addToggle(root, "إيقاف الاهتزاز عند الوضع الصامت", muteOnSilent, on -> { muteOnSilent = on; save(); });
 
         gainLabel = text(root, "", 14);
         root.addView(seek(0, 300, (int) (gain * 100), v -> { gain = v / 100f; save(); refreshLabels(); }));
@@ -57,7 +56,7 @@ public class MainActivity extends Activity {
 
         text(root, "طور السماعات:", 14);
         radios(root, new String[]{"هادئ: طور معاكس (صوت أقل، موصى به)", "قوي: طور متطابق (أقوى وأعلى صوتاً)"},
-                phase, v -> { phase = v; save(); });
+                phase == 1 ? 0 : 1, v -> { phase = (v == 0) ? 1 : 0; save(); });
 
         text(root, "مصدر الصوت:", 14);
         radios(root, new String[]{"تلقائي", "ثابت (BEACON): قوة مستقلة عن أي مستوى صوت", "المنبّه (يتبع مستوى صوت المنبّه)"},
@@ -153,13 +152,14 @@ public class MainActivity extends Activity {
 
     interface OnBool { void on(boolean v); }
 
-    void addSwitch(LinearLayout root, String label, boolean init, OnBool cb) {
-        Switch sw = new Switch(this);
-        sw.setText(label);
-        sw.setChecked(init);
-        sw.setPadding(0, 16, 0, 16);
-        sw.setOnCheckedChangeListener((b, on) -> cb.on(on));
-        root.addView(sw);
+    void addToggle(LinearLayout root, String label, boolean init, OnBool cb) {
+        final Button bt = new Button(this);
+        final boolean[] st = {init};
+        bt.setAllCaps(false);
+        Runnable paint = () -> bt.setText(label + ":  " + (st[0] ? "مفعّل ✔" : "متوقف ✘"));
+        paint.run();
+        bt.setOnClickListener(v -> { st[0] = !st[0]; paint.run(); cb.on(st[0]); });
+        root.addView(bt);
     }
 
     void radios(LinearLayout root, String[] names, int sel, OnVal cb) {
