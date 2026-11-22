@@ -28,6 +28,7 @@ final class Guard {
                     if ("1".equals(get.invoke(null, "sys.boot_completed"))) {
                         new File(COUNTER).delete();
                         L.i("boot completed, crash counter cleared");
+                        Status.bootCompleted();
                         return;
                     }
                     Thread.sleep(3000);

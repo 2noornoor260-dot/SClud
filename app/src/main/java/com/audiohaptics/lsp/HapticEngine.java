@@ -81,6 +81,7 @@ final class HapticEngine implements Runnable {
         thread.setDaemon(true);
         thread.start();
         L.i("engine started");
+        Status.put("5.engine", "thread started");
     }
 
     void post(Runnable r, long delayMs) { cb.postDelayed(r, Math.max(0, delayMs)); }
@@ -224,6 +225,7 @@ final class HapticEngine implements Runnable {
                 if (!playing) startTrack();
                 pump();
             } catch (Throwable t) {
+                Status.put("6.audio", "ERROR " + t);
                 L.e("engine loop", t);
                 releaseTrack();
                 LockSupport.parkNanos(1_000_000_000L);
@@ -274,6 +276,7 @@ final class HapticEngine implements Runnable {
         track = t;
         trackInfo = "perfMode=" + t.getPerformanceMode() + " cap=" + t.getBufferCapacityInFrames();
         L.i("track ready: burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
+        Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
         return true;
     }
 

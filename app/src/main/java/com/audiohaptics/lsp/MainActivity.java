@@ -21,7 +21,7 @@ import java.util.Locale;
 public class MainActivity extends Activity {
     float gain = 1f, tone = 1f;
     int warm = 1;
-    TextView status, hint, gainLabel, toneLabel;
+    TextView status, hint, gainLabel, toneLabel, report;
     Vibrator vib;
 
     @Override protected void onCreate(Bundle b) {
@@ -37,6 +37,8 @@ public class MainActivity extends Activity {
         setContentView(sv);
 
         status = text(root, "", 16);
+        report = text(root, "", 12);
+        report.setTypeface(android.graphics.Typeface.MONOSPACE);
         gainLabel = text(root, "", 14);
         root.addView(seek(20, 250, (int) (gain * 100), v -> { gain = v / 100f; save(); refreshLabels(); }));
         toneLabel = text(root, "", 14);
@@ -92,7 +94,11 @@ public class MainActivity extends Activity {
         super.onResume();
         boolean has = vib != null && vib.hasVibrator();
         status.setText(has ? "✔ النظام يرى الآن هزازاً (الوحدة تعمل)"
-                : "✘ لا يوجد هزاز: فعّل الوحدة في LSPosed (النطاق: System Framework) ثم أعد التشغيل");
+                : "✘ لا يوجد هزاز بعد");
+        String r = null;
+        try { r = Settings.Global.getString(getContentResolver(), Status.KEY); } catch (Throwable ignored) { }
+        report.setText(r != null ? "تقرير system_server:\n" + r
+                : "تقرير system_server: (لا يوجد)\nالوحدة لم تعمل داخل system_server: تأكد أنها مفعّلة في LSPosed وأن «System Framework» مُحدَّد في نطاقها، ثم أعد التشغيل.");
     }
 
     void refreshLabels() {
@@ -170,7 +176,6 @@ public class MainActivity extends Activity {
                 int effectId = (int) VibrationEffect.class.getField("EFFECT_THUD").get(null);
                 vib.vibrate(VibrationEffect.createPredefined(effectId));
             } catch (Throwable e) {
-                // Fallback: heavy click if EFFECT_THUD not available on this device
                 vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK));
             }
         });

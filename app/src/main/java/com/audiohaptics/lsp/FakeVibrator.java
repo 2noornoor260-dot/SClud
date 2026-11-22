@@ -26,6 +26,7 @@ final class FakeVibrator {
     private volatile Object vibCallbacks;
     private Object info;
     private Object vibProxy, mgrProxy;
+    private int onCalls;
 
     static Object createManager(ClassLoader cl) throws Throwable {
         FakeVibrator f = new FakeVibrator(cl);
@@ -42,6 +43,7 @@ final class FakeVibrator {
         try { onVibrating = Class.forName("android.os.IVibratorStateListener").getMethod("onVibrating", boolean.class); }
         catch (Throwable t) { L.e("IVibratorStateListener", t); }
         info = buildInfo();
+        Status.put("4.fake", "proxies created");
         vibProxy = Proxy.newProxyInstance(cl, new Class<?>[]{vibI}, (InvocationHandler) this::vibrator);
         mgrProxy = Proxy.newProxyInstance(cl, new Class<?>[]{mgrI}, (InvocationHandler) this::manager);
     }
@@ -107,6 +109,7 @@ final class FakeVibrator {
     private long on(Class<?> third, Object[] a) throws Throwable {
         long vibId = (Long) a[0], stepId = (Long) a[1];
         engine.start();
+        Status.put("7.on", "calls=" + (++onCalls) + " last=" + third.getSimpleName());
         long dur;
         if (third == long.class) {
             dur = Math.max(1, Math.min((Long) a[2], 30_000L));
