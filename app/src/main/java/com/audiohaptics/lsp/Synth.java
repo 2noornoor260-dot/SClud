@@ -18,44 +18,50 @@ final class Synth {
         }
     }
 
-    static int effectDur(int id) {
+    /** base durations (ms) at punch = 1 */
+    static int effectBase(int id) {
         switch (id) {
-            case 0: return 28; case 1: return 118; case 2: return 14; case 3: return 60;
-            case 4: return 22; case 5: return 40; case 21: return 9;
+            case 0: return 32; case 2: return 20; case 3: return 70; case 4: return 28; case 5: return 50; case 21: return 14;
             default: return 0;
         }
     }
 
+    static int effectDur(int id, float punch) {
+        if (id == 1) return 2 * Math.round(effectBase(0) * punch) + 45;
+        return Math.round(effectBase(id) * punch);
+    }
+
     private static final HashMap<Integer, float[]> cache = new HashMap<>();
-    private static float cacheTone = -1f;
+    private static float cacheKey = -1f;
 
     /** id 0..21 = prebaked effects, 100+n = primitive n. */
-    static synchronized float[] effect(int id, float tone) {
-        if (tone != cacheTone) { cache.clear(); cacheTone = tone; }
+    static synchronized float[] effect(int id, float tone, float punch) {
+        float key = tone * 1000f + punch;
+        if (key != cacheKey) { cache.clear(); cacheKey = key; }
         float[] w = cache.get(id);
-        if (w == null) { w = build(id, tone); cache.put(id, w); }
+        if (w == null) { w = build(id, tone, punch); cache.put(id, w); }
         return w;
     }
 
-    private static float[] build(int id, float t) {
+    private static float[] build(int id, float t, float k) {
         switch (id) {
-            case 0: case 101: return burst(150 * t, 150 * t, 30, 1.5f, 8f, 4f, 0.85f, 0f);
-            case 2: case 107: return burst(210 * t, 210 * t, 16, 1.0f, 4f, 3f, 0.50f, 0f);
-            case 3: case 102: return burst(100 * t, 90 * t, 65, 2.5f, 20f, 8f, 1.00f, 0f);
-            case 4: return burst(185 * t, 165 * t, 24, 1.2f, 6f, 4f, 0.70f, 0f);
-            case 5: return burst(125 * t, 115 * t, 44, 1.5f, 12f, 6f, 1.00f, 0f);
-            case 21: return burst(240 * t, 240 * t, 11, 0.8f, 2.5f, 2.5f, 0.30f, 0f);
-            case 103: return burst(80 * t, 140 * t, 45, 4f, 0f, 8f, 0.80f, 0f);
-            case 104: return burst(140 * t, 170 * t, 50, 44f, 0f, 4f, 0.80f, 0f);
-            case 105: return burst(130 * t, 170 * t, 120, 110f, 0f, 8f, 0.85f, 0f);
-            case 106: return burst(170 * t, 125 * t, 35, 1.5f, 12f, 4f, 0.80f, 0f);
-            case 108: return burst(150 * t, 140 * t, 22, 1.2f, 6f, 4f, 0.45f, 0f);
+            case 0: case 101: return burst(150 * t, 150 * t, 32 * k, 2.0f, 0f, 5f, 0.90f, 0f, 0.30f);
+            case 2: case 107: return burst(210 * t, 210 * t, 20 * k, 1.5f, 0f, 4f, 0.60f, 0f, 0.25f);
+            case 3: case 102: return burst(100 * t, 90 * t, 70 * k, 3.0f, 0f, 12f, 1.00f, 0f, 0.30f);
+            case 4: return burst(185 * t, 165 * t, 28 * k, 2.0f, 0f, 5f, 0.80f, 0f, 0.30f);
+            case 5: return burst(125 * t, 115 * t, 50 * k, 2.5f, 0f, 8f, 1.00f, 0f, 0.30f);
+            case 21: return burst(240 * t, 240 * t, 14 * k, 1.0f, 0f, 3f, 0.40f, 0f, 0.20f);
+            case 103: return burst(80 * t, 140 * t, 45, 4f, 0f, 8f, 0.80f, 0f, 0.25f);
+            case 104: return burst(140 * t, 170 * t, 50, 44f, 0f, 4f, 0.80f, 0f, 0.25f);
+            case 105: return burst(130 * t, 170 * t, 120, 110f, 0f, 8f, 0.85f, 0f, 0.25f);
+            case 106: return burst(170 * t, 125 * t, 35, 1.5f, 12f, 4f, 0.80f, 0f, 0.25f);
+            case 108: return burst(150 * t, 140 * t, 22 * k, 1.2f, 0f, 4f, 0.50f, 0f, 0.25f);
             default: return new float[0];
         }
     }
 
     /** f0->f1 sine, smoothstep attack, exponential decay (tau>0) or hold, linear release at the end. */
-    static float[] burst(float f0, float f1, float durMs, float attMs, float tauMs, float relMs, float amp, float snap) {
+    static float[] burst(float f0, float f1, float durMs, float attMs, float tauMs, float relMs, float amp, float snap, float harm) {
         int n = Math.max(8, (int) (SR * durMs / 1000f));
         float[] o = new float[n];
         int att = Math.max(1, (int) (SR * attMs / 1000f));
@@ -68,7 +74,7 @@ final class Synth {
             if (i < att) { float x = i / (float) att; env = x * x * (3 - 2 * x); }
             else env = tauMs > 0 ? (float) Math.exp(-(i - att) / (SR * tauMs / 1000f)) : 1f;
             if (i > n - rel) env *= (n - i) / (float) rel;
-            o[i] = (float) Math.sin(ph) * env * amp;
+            o[i] = (float) (Math.sin(ph) + harm * Math.sin(2 * ph)) / (1f + harm) * env * amp;
         }
         if (snap > 0) {
             int sn = (int) (SR * 0.0012f);

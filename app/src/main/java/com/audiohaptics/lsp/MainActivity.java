@@ -24,7 +24,9 @@ import java.util.Locale;
 public class MainActivity extends Activity {
     boolean enabled = true, muteOnSilent = true;
     int phase = 1, src = 0, warm = 1;
-    float gain = 1f, tone = 1f, soft = 0.6f;
+    float gain = 1f, tone = 1f, soft = 0.6f, punch = 1.8f;
+    int labModeCmd = 2, labFreqCmd = 0, labSel = 0;
+    TextView punchLabel, labLabel;
     TextView status, report, hint, gainLabel, toneLabel, softLabel, sweepLabel;
     SeekBar toneBar;
     long sweepId;
@@ -61,6 +63,8 @@ public class MainActivity extends Activity {
         root.addView(toneBar);
         softLabel = text(root, "", 14);
         root.addView(seek(0, 100, (int) (soft * 100), v -> { soft = v / 100f; save(); refreshLabels(); }));
+        punchLabel = text(root, "", 14);
+        root.addView(seek(50, 350, (int) (punch * 100), v -> { punch = v / 100f; save(); refreshLabels(); }));
 
         text(root, "طور السماعات:", 14);
         radios(root, new String[]{"هادئ: طور معاكس (صوت أقل، موصى به)", "قوي: طور متطابق (أقوى وأعلى صوتاً)"},
@@ -74,11 +78,29 @@ public class MainActivity extends Activity {
         radios(root, new String[]{"عند الطلب فقط (تأخير أول نقرة ~100ms)", "أثناء تشغيل الشاشة (موصى به)", "دائماً"},
                 warm, v -> { warm = v; save(); });
 
+        text(root, "مختبر السماعات: اعرف أي السماعات تعمل (ضع إصبعك على كل فتحة سماعة)", 14);
+        radios(root, new String[]{"150 هرتز (اهتزاز)", "600 هرتز", "2500 هرتز"}, 0, v -> { labSel = v; });
+        String[] labNames = {"اليسار فقط", "اليمين فقط", "الاثنان بنفس الطور", "الاثنان بطور معاكس"};
+        for (int i = 0; i < 4; i++) {
+            final int mode = i;
+            Button lb = new Button(this);
+            lb.setText(labNames[i] + " (4 ثوانٍ)");
+            lb.setAllCaps(false);
+            lb.setOnClickListener(v -> {
+                int[] hz = {150, 600, 2500};
+                labModeCmd = mode; labFreqCmd = hz[labSel];
+                sweeping = false; sweepId = System.currentTimeMillis();
+                save();
+            });
+            root.addView(lb);
+        }
+        labLabel = text(root, "سجّل أي السماعات (أعلى/أسفل/يمين/يسار) تعمل مع كل زر وكل تردد، وأرسل لي النتيجة.", 12);
+
         text(root, "معايرة التردد: ابحث عن التردد الذي يهتز عنده هيكل الجهاز أقوى ما يمكن:", 14);
         Button sw1 = new Button(this);
         sw1.setText("ابدأ المسح (50 ← 400 هرتز خلال 16 ثانية)");
         sw1.setAllCaps(false);
-        sw1.setOnClickListener(v -> { sweeping = true; lastF = 0; sweepId = System.currentTimeMillis(); save(); ui.post(sweepPoll); });
+        sw1.setOnClickListener(v -> { labFreqCmd = 0; sweeping = true; lastF = 0; sweepId = System.currentTimeMillis(); save(); ui.post(sweepPoll); });
         root.addView(sw1);
         sweepLabel = text(root, "امسك الجهاز بيديك أو ضعه على طاولة، واضغط الزر التالي عندما يكون الاهتزاز (لا الصوت) أقوى ما يمكن", 12);
         Button sw2 = new Button(this);
@@ -172,6 +194,7 @@ public class MainActivity extends Activity {
     void refreshLabels() {
         gainLabel.setText(String.format(Locale.US, "القوة (مستقلة): %d%%", (int) (gain * 100)));
         toneLabel.setText(String.format(Locale.US, "تردد الاهتزاز: ~%d هرتز (%d%%)", (int) (150 * tone), (int) (tone * 100)));
+        punchLabel.setText(String.format(Locale.US, "طول/طاقة النقرة (أعلى = إحساس أقوى وأقل حدّة): %d%%", (int) (punch * 100)));
         softLabel.setText(String.format(Locale.US, "النعومة (تقليل الصوت الحاد): %d%%", (int) (soft * 100)));
     }
 
@@ -191,6 +214,7 @@ public class MainActivity extends Activity {
                     case "t": tone = Float.parseFloat(p[1]); break;
                     case "s": soft = Float.parseFloat(p[1]); break;
                     case "w": warm = Integer.parseInt(p[1]); break;
+                    case "u": punch = Float.parseFloat(p[1]); break;
                 }
             }
         } catch (Throwable ignored) { }
@@ -199,8 +223,8 @@ public class MainActivity extends Activity {
     void save() {
         try {
             Settings.Global.putString(getContentResolver(), Config.KEY, String.format(Locale.US,
-                    "e=%d;m=%d;p=%d;k=%d;g=%.2f;t=%.2f;s=%.2f;w=%d;x=%d",
-                    enabled ? 1 : 0, muteOnSilent ? 1 : 0, phase, src, gain, tone, soft, warm, sweepId));
+                    "e=%d;m=%d;p=%d;k=%d;g=%.2f;t=%.2f;s=%.2f;w=%d;u=%.2f;lm=%d;lf=%d;x=%d",
+                    enabled ? 1 : 0, muteOnSilent ? 1 : 0, phase, src, gain, tone, soft, warm, punch, labModeCmd, labFreqCmd, sweepId));
             if (hint != null) hint.setVisibility(View.GONE);
         } catch (SecurityException e) {
             if (hint != null) {

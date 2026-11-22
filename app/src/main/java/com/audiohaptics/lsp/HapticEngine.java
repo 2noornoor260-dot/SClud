@@ -73,7 +73,8 @@ final class HapticEngine implements Runnable {
     private static final double SWEEP_S = 16.0;
     private volatile boolean sweepActive;
     private long sweepStart, lastSweepStatus, lastSweep = Long.MIN_VALUE;
-    private double sweepPh;
+    private double sweepPh, sweepDur = 16.0;
+    private volatile int labF, labM;
     private long lastAlive;
 
     HapticEngine(StateListener l) {
@@ -99,22 +100,22 @@ final class HapticEngine implements Runnable {
     float strengthGain(int s) { return s <= 0 ? 0.5f : (s == 1 ? 1.0f : 1.6f); }
 
     long effect(int id, int strength) {
-        int d = Synth.effectDur(id);
+        int d = Synth.effectDur(id, cfg.punch);
         if (d <= 0) return 0;
         float g = strengthGain(strength);
         if (id == 1) {
-            float[] c = Synth.effect(0, cfg.tone);
+            float[] c = Synth.effect(0, cfg.tone, cfg.punch);
             addPulse(c, g, 0);
-            addPulse(c, g * 0.9f, 90);
+            addPulse(c, g * 0.9f, Math.round(Synth.effectBase(0) * cfg.punch) + 45);
         } else {
-            addPulse(Synth.effect(id, cfg.tone), g, 0);
+            addPulse(Synth.effect(id, cfg.tone, cfg.punch), g, 0);
         }
         busy(d);
         return d;
     }
 
     void primitive(int id, float scale, int delayMs) {
-        float[] w = Synth.effect(100 + id, cfg.tone);
+        float[] w = Synth.effect(100 + id, cfg.tone, cfg.punch);
         if (w.length > 0) addPulse(w, Config.clamp(scale, 0f, 1.5f), delayMs);
     }
 
@@ -180,6 +181,9 @@ final class HapticEngine implements Runnable {
         if (id == lastSweep) return;
         lastSweep = id;
         if (id > 0 && enabledNow()) {
+            labF = cfg.labFreq;
+            labM = cfg.labMode;
+            sweepDur = labF > 0 ? 4.0 : SWEEP_S;
             sweepStart = System.nanoTime();
             sweepPh = 0;
             sweepActive = true;
@@ -478,35 +482,38 @@ final class HapticEngine implements Runnable {
         if (sweepActive) {
             long nowN = System.nanoTime();
             double el = (nowN - sweepStart) / 1e9;
-            if (el > SWEEP_S) {
+            if (el > sweepDur) {
                 sweepActive = false;
                 Status.put("10.sweep", "finished");
             } else {
                 for (int i = 0; i < n; i++) {
                     double te = el + i / (double) SR;
-                    double f = 50.0 * Math.pow(8.0, Math.min(1.0, te / SWEEP_S));
+                    double f = labF > 0 ? labF : 50.0 * Math.pow(8.0, Math.min(1.0, te / sweepDur));
                     sweepPh += 2 * Math.PI * f / SR;
-                    double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, SWEEP_S - te) / 0.05));
+                    double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, sweepDur - te) / 0.05));
                     mix[i] += 0.7f * (float) ramp * (float) Math.sin(sweepPh);
                 }
                 if (sweepPh > 1e6) sweepPh %= 2 * Math.PI;
-                if (nowN - lastSweepStatus > 250_000_000L) {
+                if (labF == 0 && nowN - lastSweepStatus > 250_000_000L) {
                     lastSweepStatus = nowN;
-                    Status.put("10.sweep", "f=" + (int) (50.0 * Math.pow(8.0, el / SWEEP_S)));
+                    Status.put("10.sweep", "f=" + (int) (50.0 * Math.pow(8.0, el / sweepDur)));
                 }
             }
         }
         // softness: 2-pole low-pass, cutoff 1500 Hz (soft=0) .. 250 Hz (soft=1)
         double fc = 1500.0 * Math.pow(250.0 / 1500.0, cfg.soft);
-        float alpha = (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
+        boolean lab = sweepActive && labF > 0;
+        float alpha = lab ? 1f : (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
         float g = cfg.gain * REF * comp;
         boolean anti = cfg.phase == 1;
         for (int i = 0; i < n; i++) {
             lp1 += alpha * (mix[i] * g - lp1);
             lp2 += alpha * (lp1 - lp2);
             short s = (short) (Synth.limit(lp2) * 32767f);
-            pcm[2 * i] = s;
-            pcm[2 * i + 1] = anti ? (short) -s : s;
+            short l = s, r = anti ? (short) -s : s;
+            if (lab) { l = labM == 1 ? 0 : s; r = labM == 0 ? 0 : (labM == 3 ? (short) -s : s); }
+            pcm[2 * i] = l;
+            pcm[2 * i + 1] = r;
         }
         int w = track.write(pcm, 0, n * 2, AudioTrack.WRITE_BLOCKING);
         if (w < 0) throw new IllegalStateException("AudioTrack.write=" + w);

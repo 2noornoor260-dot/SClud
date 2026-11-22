@@ -13,6 +13,8 @@ final class Config {
     volatile float gain = 1.0f;           // g: strength (own control, 0..3)
     volatile float tone = 1.0f;           // t: carrier frequency multiplier
     volatile float soft = 0.6f;           // s: softness (low-pass), 0..1
+    volatile float punch = 1.8f;          // u: click length/energy multiplier
+    volatile int labMode = 2, labFreq = 0; // lm / lf: speaker-lab tone (0 L only, 1 R only, 2 both, 3 anti-phase)
     volatile long sweep = 0;              // x: frequency-calibration sweep command id (0 = stop)
     volatile int warm = 1;                // w: 0 on demand, 1 while screen on, 2 always
 
@@ -32,6 +34,9 @@ final class Config {
                     case "g": gain = clamp(Float.parseFloat(p[1]), 0f, 3f); break;
                     case "t": tone = clamp(Float.parseFloat(p[1]), 0.4f, 3f); break;
                     case "x": sweep = Long.parseLong(p[1]); break;
+                    case "u": punch = clamp(Float.parseFloat(p[1]), 0.5f, 3.5f); break;
+                    case "lm": labMode = Math.max(0, Math.min(3, Integer.parseInt(p[1]))); break;
+                    case "lf": labFreq = Math.max(0, Math.min(8000, Integer.parseInt(p[1]))); break;
                     case "s": soft = clamp(Float.parseFloat(p[1]), 0f, 1f); break;
                     case "w": warm = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
                 }
