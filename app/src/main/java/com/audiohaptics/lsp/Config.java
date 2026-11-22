@@ -13,6 +13,7 @@ final class Config {
     volatile float gain = 1.0f;           // g: strength (own control, 0..3)
     volatile float tone = 1.0f;           // t: carrier frequency multiplier
     volatile float soft = 0.6f;           // s: softness (low-pass), 0..1
+    volatile long sweep = 0;              // x: frequency-calibration sweep command id (0 = stop)
     volatile int warm = 1;                // w: 0 on demand, 1 while screen on, 2 always
 
     void refresh(Context c) {
@@ -29,7 +30,8 @@ final class Config {
                     case "p": phase = Math.max(0, Math.min(1, Integer.parseInt(p[1]))); break;
                     case "k": src = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
                     case "g": gain = clamp(Float.parseFloat(p[1]), 0f, 3f); break;
-                    case "t": tone = clamp(Float.parseFloat(p[1]), 0.5f, 2f); break;
+                    case "t": tone = clamp(Float.parseFloat(p[1]), 0.4f, 3f); break;
+                    case "x": sweep = Long.parseLong(p[1]); break;
                     case "s": soft = clamp(Float.parseFloat(p[1]), 0f, 1f); break;
                     case "w": warm = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
                 }

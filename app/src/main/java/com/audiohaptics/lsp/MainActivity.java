@@ -3,6 +3,8 @@ package com.audiohaptics.lsp;
 import android.app.Activity;
 import android.graphics.Typeface;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.provider.Settings;
@@ -23,7 +25,12 @@ public class MainActivity extends Activity {
     boolean enabled = true, muteOnSilent = true;
     int phase = 1, src = 0, warm = 1;
     float gain = 1f, tone = 1f, soft = 0.6f;
-    TextView status, report, hint, gainLabel, toneLabel, softLabel;
+    TextView status, report, hint, gainLabel, toneLabel, softLabel, sweepLabel;
+    SeekBar toneBar;
+    long sweepId;
+    int lastF;
+    boolean sweeping;
+    final Handler ui = new Handler(Looper.getMainLooper());
     Vibrator vib;
 
     interface OnVal { void on(int v); }
@@ -50,7 +57,8 @@ public class MainActivity extends Activity {
         gainLabel = text(root, "", 14);
         root.addView(seek(0, 300, (int) (gain * 100), v -> { gain = v / 100f; save(); refreshLabels(); }));
         toneLabel = text(root, "", 14);
-        root.addView(seek(50, 200, (int) (tone * 100), v -> { tone = v / 100f; save(); refreshLabels(); }));
+        toneBar = seek(40, 300, (int) (tone * 100), v -> { tone = v / 100f; save(); refreshLabels(); });
+        root.addView(toneBar);
         softLabel = text(root, "", 14);
         root.addView(seek(0, 100, (int) (soft * 100), v -> { soft = v / 100f; save(); refreshLabels(); }));
 
@@ -59,12 +67,33 @@ public class MainActivity extends Activity {
                 phase == 1 ? 0 : 1, v -> { phase = (v == 0) ? 1 : 0; save(); });
 
         text(root, "مصدر الصوت:", 14);
-        radios(root, new String[]{"تلقائي", "ثابت (BEACON): قوة مستقلة عن أي مستوى صوت", "المنبّه (يتبع مستوى صوت المنبّه)"},
+        radios(root, new String[]{"تلقائي", "ثابت (BEACON): تجريبي", "المنبّه مع تعويض مستوى الصوت (موصى به)"},
                 src, v -> { src = v; save(); });
 
         text(root, "إبقاء مسار الصوت جاهزاً (أقل تأخير):", 14);
         radios(root, new String[]{"عند الطلب فقط (تأخير أول نقرة ~100ms)", "أثناء تشغيل الشاشة (موصى به)", "دائماً"},
                 warm, v -> { warm = v; save(); });
+
+        text(root, "معايرة التردد: ابحث عن التردد الذي يهتز عنده هيكل الجهاز أقوى ما يمكن:", 14);
+        Button sw1 = new Button(this);
+        sw1.setText("ابدأ المسح (50 ← 400 هرتز خلال 16 ثانية)");
+        sw1.setAllCaps(false);
+        sw1.setOnClickListener(v -> { sweeping = true; lastF = 0; sweepId = System.currentTimeMillis(); save(); ui.post(sweepPoll); });
+        root.addView(sw1);
+        sweepLabel = text(root, "امسك الجهاز بيديك أو ضعه على طاولة، واضغط الزر التالي عندما يكون الاهتزاز (لا الصوت) أقوى ما يمكن", 12);
+        Button sw2 = new Button(this);
+        sw2.setText("هذا هو الأقوى: اعتمد هذا التردد");
+        sw2.setAllCaps(false);
+        sw2.setOnClickListener(v -> {
+            if (lastF >= 50) {
+                tone = Math.max(0.4f, Math.min(3f, lastF / 150f));
+                toneBar.setProgress(Math.max(0, Math.min(260, (int) (tone * 100) - 40)));
+                refreshLabels();
+            }
+            sweeping = false; sweepId = 0; save();
+            sweepLabel.setText("تم اعتماد ~" + lastF + " هرتز");
+        });
+        root.addView(sw2);
 
         text(root, "اختبار:", 14);
         addTest(root, "Tick", VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));
@@ -99,18 +128,50 @@ public class MainActivity extends Activity {
         refreshLabels();
     }
 
-    @Override protected void onResume() {
-        super.onResume();
+    final Runnable sweepPoll = new Runnable() {
+        @Override public void run() {
+            if (!sweeping) return;
+            try {
+                String r = Settings.Global.getString(getContentResolver(), Status.KEY);
+                if (r != null) for (String line : r.split("\n")) {
+                    if (line.startsWith("10.sweep: f=")) { lastF = Integer.parseInt(line.substring(12).trim()); }
+                }
+                sweepLabel.setText("التردد الحالي: ~" + lastF + " هرتز");
+            } catch (Throwable ignored) { }
+            ui.postDelayed(this, 300);
+        }
+    };
+
+    final Runnable reportRefresh = new Runnable() {
+        @Override public void run() {
+            showReport();
+            ui.postDelayed(this, 2000);
+        }
+    };
+
+    void showReport() {
         boolean has = vib != null && vib.hasVibrator();
         status.setText(has ? "✔ النظام يرى الآن هزازاً (الوحدة تعمل)" : "✘ لا يوجد هزاز بعد");
         String r = null;
         try { r = Settings.Global.getString(getContentResolver(), Status.KEY); } catch (Throwable ignored) { }
-        report.setText(r != null ? "تقرير system_server:\n" + r : "تقرير system_server: (لا يوجد)");
+        report.setText(r != null ? "تقرير system_server (يتجدد كل ثانيتين):\n" + r : "تقرير system_server: (لا يوجد)");
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        ui.removeCallbacks(reportRefresh);
+        ui.removeCallbacks(sweepPoll);
+        if (sweeping) { sweeping = false; sweepId = 0; save(); }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        ui.post(reportRefresh);
     }
 
     void refreshLabels() {
         gainLabel.setText(String.format(Locale.US, "القوة (مستقلة): %d%%", (int) (gain * 100)));
-        toneLabel.setText(String.format(Locale.US, "حدّة النغمة (التردد): %d%%", (int) (tone * 100)));
+        toneLabel.setText(String.format(Locale.US, "تردد الاهتزاز: ~%d هرتز (%d%%)", (int) (150 * tone), (int) (tone * 100)));
         softLabel.setText(String.format(Locale.US, "النعومة (تقليل الصوت الحاد): %d%%", (int) (soft * 100)));
     }
 
@@ -138,8 +199,8 @@ public class MainActivity extends Activity {
     void save() {
         try {
             Settings.Global.putString(getContentResolver(), Config.KEY, String.format(Locale.US,
-                    "e=%d;m=%d;p=%d;k=%d;g=%.2f;t=%.2f;s=%.2f;w=%d",
-                    enabled ? 1 : 0, muteOnSilent ? 1 : 0, phase, src, gain, tone, soft, warm));
+                    "e=%d;m=%d;p=%d;k=%d;g=%.2f;t=%.2f;s=%.2f;w=%d;x=%d",
+                    enabled ? 1 : 0, muteOnSilent ? 1 : 0, phase, src, gain, tone, soft, warm, sweepId));
             if (hint != null) hint.setVisibility(View.GONE);
         } catch (SecurityException e) {
             if (hint != null) {

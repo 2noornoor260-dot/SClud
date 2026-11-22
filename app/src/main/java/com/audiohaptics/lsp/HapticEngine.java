@@ -69,6 +69,11 @@ final class HapticEngine implements Runnable {
     private volatile long lastPump = System.nanoTime();
     private volatile float comp = 1f;          // keeps strength constant when the ALARM source is used
     private int usedSrc, stalls;
+    private boolean receiversOk;
+    private static final double SWEEP_S = 16.0;
+    private volatile boolean sweepActive;
+    private long sweepStart, lastSweepStatus, lastSweep = Long.MIN_VALUE;
+    private double sweepPh;
     private long lastAlive;
 
     HapticEngine(StateListener l) {
@@ -169,6 +174,22 @@ final class HapticEngine implements Runnable {
         } catch (Throwable e) { comp = 1f; }
     }
 
+    private void handleSweep() {
+        long id = cfg.sweep;
+        if (lastSweep == Long.MIN_VALUE) { lastSweep = id; return; }     // never start a stale sweep after a reboot
+        if (id == lastSweep) return;
+        lastSweep = id;
+        if (id > 0 && enabledNow()) {
+            sweepStart = System.nanoTime();
+            sweepPh = 0;
+            sweepActive = true;
+            wake();
+        } else {
+            sweepActive = false;
+            Status.put("10.sweep", "stopped");
+        }
+    }
+
     private boolean enabledNow() { return cfg.enabled && !(cfg.muteOnSilent && silent); }
 
     private final Runnable endCheck = new Runnable() {
@@ -198,18 +219,14 @@ final class HapticEngine implements Runnable {
     private Context ctx() {
         if (ctx != null) return ctx;
         Context c = SysCtx.get();
-        if (c == null) return null;
-        ctx = c;
-        registerReceivers(c);
+        if (c != null) ctx = c;
         return ctx;
     }
 
-    private void registerReceivers(Context c) {
+    /** Registered lazily and retried every second: AudioService may not exist yet when the engine first starts. */
+    private void ensureReceivers(Context c) {
+        if (receiversOk || c == null) return;
         try {
-            PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
-            if (pm != null) screenOn = pm.isInteractive();
-            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
-            if (am != null) silent = am.getRingerMode() == AudioManager.RINGER_MODE_SILENT;
             IntentFilter f = new IntentFilter();
             f.addAction(Intent.ACTION_SCREEN_ON);
             f.addAction(Intent.ACTION_SCREEN_OFF);
@@ -226,7 +243,25 @@ final class HapticEngine implements Runnable {
                     }
                 }
             }, f, null, cb);
-        } catch (Throwable e) { L.e("receivers", e); }
+            receiversOk = true;
+        } catch (Throwable e) { L.e("receivers (will retry)", e); }
+    }
+
+    /** Polls the real state once a second as a safety net next to the broadcasts. */
+    private void pollState(Context c) {
+        if (c == null) return;
+        try {
+            PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) screenOn = pm.isInteractive();
+        } catch (Throwable ignored) { }
+        try {
+            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                boolean s = am.getRingerMode() == AudioManager.RINGER_MODE_SILENT;
+                if (s && !silent) off();
+                silent = s;
+            }
+        } catch (Throwable ignored) { }
     }
 
     private void boostThread() {
@@ -251,7 +286,10 @@ final class HapticEngine implements Runnable {
             try {
                 long now = System.nanoTime();
                 if (now - lastCfg > 1_000_000_000L) {
-                    cfg.refresh(ctx()); lastCfg = now; reportState();
+                    cfg.refresh(ctx()); lastCfg = now;
+                    ensureReceivers(ctx); pollState(ctx);
+                    handleSweep();
+                    reportState();
                     if (ctx != null && track != null) updateComp(ctx);
                     if (now - lastAlive > 5_000_000_000L) {
                         lastAlive = now;
@@ -261,13 +299,13 @@ final class HapticEngine implements Runnable {
                 }
                 lastPump = Math.max(lastPump, now - 1_000_000_000L);
                 if (!enabledNow()) {
-                    inbox.clear(); voices.clear(); susEnd = 0; susCur = 0;
+                    inbox.clear(); voices.clear(); susEnd = 0; susCur = 0; sweepActive = false;
                     if (playing) stopTrack();
                     LockSupport.parkNanos(150_000_000L);
                     continue;
                 }
                 if (track != null && appliedSrc != cfg.src) releaseTrack();   // source changed in the app
-                boolean work = !inbox.isEmpty() || !voices.isEmpty() || now < susEnd || susCur > 1e-4f || cancelPending;
+                boolean work = !inbox.isEmpty() || !voices.isEmpty() || now < susEnd || susCur > 1e-4f || cancelPending || sweepActive;
                 boolean warm = work || now < warmUntil || cfg.warm == 2 || (cfg.warm == 1 && screenOn);
                 if (!warm) {
                     if (playing) stopTrack();
@@ -288,7 +326,7 @@ final class HapticEngine implements Runnable {
 
     // ------------------------------------------------------------------ audio track
 
-    private AudioTrack build(int src, AudioFormat fmt, int capBytes) {
+    private AudioTrack build(int src, AudioFormat fmt, int capBytes, AudioManager am) {
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 AudioAttributes.Builder ab = new AudioAttributes.Builder();
@@ -304,11 +342,19 @@ final class HapticEngine implements Runnable {
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                         .setBufferSizeInBytes(capBytes).build();
-                if (x.getState() == AudioTrack.STATE_INITIALIZED) return x;
+                if (x.getState() == AudioTrack.STATE_INITIALIZED) { setPreferred(x, am); return x; }
                 x.release();
             } catch (Throwable e) { L.e("AudioTrack src=" + src + " attempt " + attempt, e); }
         }
         return null;
+    }
+
+    private void setPreferred(AudioTrack t, AudioManager am) {
+        try {
+            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (d.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) { t.setPreferredDevice(d); return; }
+            }
+        } catch (Throwable e) { L.e("preferred device", e); }
     }
 
     /** Starts the track with silence (non-blocking) and waits up to ~700 ms for a routed device / consumed frames. */
@@ -350,11 +396,11 @@ final class HapticEngine implements Runnable {
                 AudioFormat.ENCODING_PCM_16BIT), burst * 4 * 4);
 
         int want = cfg.src;
-        int[] order = want == 1 ? new int[]{SRC_BEACON} : want == 2 ? new int[]{SRC_ALARM} : new int[]{SRC_BEACON, SRC_ALARM};
+        int[] order = want == 1 ? new int[]{SRC_BEACON, SRC_ALARM} : want == 2 ? new int[]{SRC_ALARM} : new int[]{SRC_ALARM, SRC_BEACON};
         AudioTrack t = null;
         int used = 0;
         for (int s : order) {
-            AudioTrack x = build(s, fmt, capBytes);
+            AudioTrack x = build(s, fmt, capBytes, am);
             if (x == null) { Status.put("6.audio.src" + s, "track creation failed"); continue; }
             boolean ok = verify(x);
             if (ok || s == SRC_ALARM) { t = x; used = s; break; }
@@ -363,11 +409,6 @@ final class HapticEngine implements Runnable {
             try { Thread.sleep(250); } catch (InterruptedException ignored) { }
         }
         if (t == null) return false;
-        try {
-            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                if (d.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) { t.setPreferredDevice(d); break; }
-            }
-        } catch (Throwable e) { L.e("preferred device", e); }
         bufFrames = burst * 2;
         t.setBufferSizeInFrames(bufFrames);
         lastUnder = 0;
@@ -377,7 +418,7 @@ final class HapticEngine implements Runnable {
         Status.remove("6.audio.src1");
         Status.remove("6.audio.src2");
         lastPump = System.nanoTime();
-        trackInfo = "src=" + (used == SRC_BEACON ? "BEACON(fixed volume)" : "ALARM") + " perfMode=" + t.getPerformanceMode()
+        trackInfo = "src=" + (used == SRC_BEACON ? "BEACON(experimental)" : "ALARM(+volume compensation)") + " perfMode=" + t.getPerformanceMode()
                 + " " + trackInfo;
         Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
         return true;
@@ -433,6 +474,27 @@ final class HapticEngine implements Runnable {
                 mix[i] += susCur * (float) (Math.sin(susPh) + 0.35 * Math.sin(2 * susPh)) / 1.35f;
             }
             if (susPh > 1e6) susPh %= 2 * Math.PI;
+        }
+        if (sweepActive) {
+            long nowN = System.nanoTime();
+            double el = (nowN - sweepStart) / 1e9;
+            if (el > SWEEP_S) {
+                sweepActive = false;
+                Status.put("10.sweep", "finished");
+            } else {
+                for (int i = 0; i < n; i++) {
+                    double te = el + i / (double) SR;
+                    double f = 50.0 * Math.pow(8.0, Math.min(1.0, te / SWEEP_S));
+                    sweepPh += 2 * Math.PI * f / SR;
+                    double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, SWEEP_S - te) / 0.05));
+                    mix[i] += 0.7f * (float) ramp * (float) Math.sin(sweepPh);
+                }
+                if (sweepPh > 1e6) sweepPh %= 2 * Math.PI;
+                if (nowN - lastSweepStatus > 250_000_000L) {
+                    lastSweepStatus = nowN;
+                    Status.put("10.sweep", "f=" + (int) (50.0 * Math.pow(8.0, el / SWEEP_S)));
+                }
+            }
         }
         // softness: 2-pole low-pass, cutoff 1500 Hz (soft=0) .. 250 Hz (soft=1)
         double fc = 1500.0 * Math.pow(250.0 / 1500.0, cfg.soft);
