@@ -164,7 +164,6 @@ public class MainActivity extends Activity {
         bt.setOnClickListener(v -> { if (vib != null) vib.vibrate(fx); });
         root.addView(bt);
     }
-
     // EFFECT_THUD is a @hide API — access via reflection at runtime
     void addTestThud(LinearLayout root) {
         Button bt = new Button(this);
@@ -181,4 +180,5 @@ public class MainActivity extends Activity {
         });
         root.addView(bt);
     }
+
 }

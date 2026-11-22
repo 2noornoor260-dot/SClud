@@ -81,7 +81,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 ids = (int[]) cl.loadClass(PKG + "HalVibratorManager").getMethod("getVibratorIds").invoke(orig);
             } catch (Throwable ignored) { }
             boolean hal = realHalDeclared();
-            if (hal || (ids != null && ids.length > 0)) {
+            if (hal) {
                 Status.put("3.factory", "call#" + n + ": real vibrator (hal=" + hal + ", ids=" + Arrays.toString(ids) + ") -> untouched");
                 return;
             }

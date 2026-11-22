@@ -2,6 +2,7 @@ package de.robv.android.xposed;
 import java.lang.reflect.Member;
 public abstract class XC_MethodHook {
     public XC_MethodHook() {}
+    public class Unhook { }
     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
     protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
     public static class MethodHookParam {
