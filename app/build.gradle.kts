@@ -6,8 +6,8 @@ android {
         applicationId = "com.audiohaptics.lsp"
         minSdk = 30
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.7"
+        versionCode = 9
+        versionName = "0.9"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

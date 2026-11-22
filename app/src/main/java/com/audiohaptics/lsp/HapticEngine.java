@@ -60,7 +60,7 @@ final class HapticEngine implements Runnable {
     private Thread thread;
     private Context ctx;
     private AudioTrack track;
-    private int burst = 240, bufFrames, lastUnder, appliedSrc = -1;
+    private int burst = 240, bufFrames, lastUnder, appliedSrc = -1, appliedOut = -1, ch = 2;
     private boolean playing;
     private long framesWritten, lastTune;
     private float[] mix = new float[240];
@@ -70,6 +70,7 @@ final class HapticEngine implements Runnable {
     private volatile float comp = 1f;          // keeps strength constant when the ALARM source is used
     private int usedSrc, stalls;
     private boolean receiversOk;
+    private volatile boolean quadBusy;
     private static final double SWEEP_S = 16.0;
     private volatile boolean sweepActive;
     private long sweepStart, lastSweepStatus, lastSweep = Long.MIN_VALUE;
@@ -180,6 +181,10 @@ final class HapticEngine implements Runnable {
         if (lastSweep == Long.MIN_VALUE) { lastSweep = id; return; }     // never start a stale sweep after a reboot
         if (id == lastSweep) return;
         lastSweep = id;
+        if (id > 0 && enabledNow() && cfg.labFreq > 0 && cfg.labMode >= 4) {
+            quadLab(cfg.labMode, cfg.labFreq);
+            return;
+        }
         if (id > 0 && enabledNow()) {
             labF = cfg.labFreq;
             labM = cfg.labMode;
@@ -192,6 +197,67 @@ final class HapticEngine implements Runnable {
             sweepActive = false;
             Status.put("10.sweep", "stopped");
         }
+    }
+
+    /**
+     * 4-channel (FL, FR, BL, BR) test track: modes 4..7 = one channel only, 8 = all in phase, 9 = diagonal anti-phase.
+     * Goes through the multichannel (direct) output if the policy accepts it; reports what the system actually did.
+     */
+    private void quadLab(final int mode, final int freq) {
+        if (quadBusy) return;
+        quadBusy = true;
+        new Thread(() -> {
+            AudioTrack t = null;
+            try {
+                Context c = ctx();
+                AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(SR).setChannelMask(AudioFormat.CHANNEL_OUT_QUAD).build();
+                AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).setFlags(0x40 | 0x80).build();
+                int min = AudioTrack.getMinBufferSize(SR, AudioFormat.CHANNEL_OUT_QUAD, AudioFormat.ENCODING_PCM_16BIT);
+                t = new AudioTrack.Builder().setAudioAttributes(attrs).setAudioFormat(fmt)
+                        .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(min, SR / 5 * 8)).build();
+                setPreferred(t, am);
+                final AudioTrack tt = t;
+                cb.postDelayed(() -> { try { tt.release(); } catch (Throwable ignored) { } }, 9000);
+                t.play();
+                final int chunk = 960;
+                short[] buf = new short[4 * chunk];
+                double ph = 0, w = 2 * Math.PI * freq / SR;
+                float amp = 0.4f * Config.clamp(cfg.gain, 0.3f, 2f);
+                AudioDeviceInfo d = null;
+                int total = SR * 4;
+                for (int pos = 0; pos < total; pos += chunk) {
+                    for (int i = 0; i < chunk; i++) {
+                        double te = (pos + i) / (double) SR;
+                        double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, 4.0 - te) / 0.05));
+                        short x = (short) (amp * ramp * Math.sin(ph) * 32767.0);
+                        short y = (short) -x;
+                        ph += w;
+                        short fl = 0, fr = 0, bl = 0, br = 0;
+                        switch (mode) {
+                            case 4: fl = x; break;
+                            case 5: fr = x; break;
+                            case 6: bl = x; break;
+                            case 7: br = x; break;
+                            case 8: fl = fr = bl = br = x; break;
+                            default: fl = x; br = x; fr = y; bl = y; break;
+                        }
+                        buf[4 * i] = fl; buf[4 * i + 1] = fr; buf[4 * i + 2] = bl; buf[4 * i + 3] = br;
+                    }
+                    t.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
+                    if (pos == 0) d = t.getRoutedDevice();
+                }
+                Status.put("11.quad", "ok mode=" + mode + " f=" + freq + " channels=" + t.getChannelCount()
+                        + " perfMode=" + t.getPerformanceMode() + " routed=" + (d == null ? "none" : "type" + d.getType()));
+            } catch (Throwable e) {
+                Status.put("11.quad", "FAILED mode=" + mode + " " + e);
+            } finally {
+                try { if (t != null) t.release(); } catch (Throwable ignored) { }
+                quadBusy = false;
+            }
+        }, "AudioHaptics-quadlab").start();
     }
 
     private boolean enabledNow() { return cfg.enabled && !(cfg.muteOnSilent && silent); }
@@ -308,7 +374,7 @@ final class HapticEngine implements Runnable {
                     LockSupport.parkNanos(150_000_000L);
                     continue;
                 }
-                if (track != null && appliedSrc != cfg.src) releaseTrack();   // source changed in the app
+                if (track != null && (appliedSrc != cfg.src || appliedOut != cfg.out)) releaseTrack();   // source changed in the app
                 boolean work = !inbox.isEmpty() || !voices.isEmpty() || now < susEnd || susCur > 1e-4f || cancelPending || sweepActive;
                 boolean warm = work || now < warmUntil || cfg.warm == 2 || (cfg.warm == 1 && screenOn);
                 if (!warm) {
@@ -331,20 +397,20 @@ final class HapticEngine implements Runnable {
     // ------------------------------------------------------------------ audio track
 
     private AudioTrack build(int src, AudioFormat fmt, int capBytes, AudioManager am) {
-        for (int attempt = 0; attempt < 2; attempt++) {
+        for (int attempt = 0; attempt < 4; attempt++) {
             try {
                 AudioAttributes.Builder ab = new AudioAttributes.Builder();
                 if (src == SRC_BEACON) {
                     // FLAG_BEACON -> "transmitted through speaker" strategy: speaker only, fixed 0 dB volume curve
                     ab.setUsage(AudioAttributes.USAGE_UNKNOWN).setContentType(AudioAttributes.CONTENT_TYPE_UNKNOWN)
-                            .setFlags(0x08 | (attempt == 0 ? 0x80 : 0));
+                            .setFlags(0x08 | (attempt % 2 == 0 ? 0x80 : 0));
                 } else {
                     ab.setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION);
-                    if (attempt == 0) ab.setFlags(0x40 | 0x80);
+                    if (attempt % 2 == 0) ab.setFlags(0x40 | 0x80);
                 }
                 AudioTrack x = new AudioTrack.Builder().setAudioAttributes(ab.build()).setAudioFormat(fmt)
                         .setTransferMode(AudioTrack.MODE_STREAM)
-                        .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                        .setPerformanceMode(attempt < 2 ? AudioTrack.PERFORMANCE_MODE_LOW_LATENCY : AudioTrack.PERFORMANCE_MODE_NONE)
                         .setBufferSizeInBytes(capBytes).build();
                 if (x.getState() == AudioTrack.STATE_INITIALIZED) { setPreferred(x, am); return x; }
                 x.release();
@@ -364,7 +430,7 @@ final class HapticEngine implements Runnable {
     /** Starts the track with silence (non-blocking) and waits up to ~700 ms for a routed device / consumed frames. */
     private boolean verify(AudioTrack t) {
         try {
-            short[] z = new short[burst * 2];
+            short[] z = new short[burst * ch];
             t.write(z, 0, z.length, AudioTrack.WRITE_NON_BLOCKING);
             t.play();
             boolean ok = false;
@@ -392,37 +458,43 @@ final class HapticEngine implements Runnable {
             if (p != null) burst = Math.max(48, Integer.parseInt(p));
         } catch (Throwable ignored) { }
         mix = new float[burst];
-        pcm = new short[burst * 2];
-
-        AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SR).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build();
-        int capBytes = Math.max(AudioTrack.getMinBufferSize(SR, AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT), burst * 4 * 4);
-
+        int wantOut = cfg.out;
         int want = cfg.src;
         int[] order = want == 1 ? new int[]{SRC_BEACON, SRC_ALARM} : want == 2 ? new int[]{SRC_ALARM} : new int[]{SRC_ALARM, SRC_BEACON};
         AudioTrack t = null;
         int used = 0;
-        for (int s : order) {
-            AudioTrack x = build(s, fmt, capBytes, am);
-            if (x == null) { Status.put("6.audio.src" + s, "track creation failed"); continue; }
-            boolean ok = verify(x);
-            if (ok || s == SRC_ALARM) { t = x; used = s; break; }
-            Status.put("6.audio.src" + s, "not routed after 700ms -> skipped");
-            x.release();
-            try { Thread.sleep(250); } catch (InterruptedException ignored) { }
+        for (int o : (wantOut == 1 ? new int[]{1, 0} : new int[]{0})) {
+            ch = o == 1 ? 4 : 2;
+            int mask = o == 1 ? AudioFormat.CHANNEL_OUT_QUAD : AudioFormat.CHANNEL_OUT_STEREO;
+            pcm = new short[burst * ch];
+            AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SR).setChannelMask(mask).build();
+            int capBytes = Math.max(AudioTrack.getMinBufferSize(SR, mask, AudioFormat.ENCODING_PCM_16BIT), burst * ch * 2 * 4);
+            for (int s : order) {
+                AudioTrack x = build(s, fmt, capBytes, am);
+                if (x == null) { Status.put("6.audio.src" + s, "track creation failed"); continue; }
+                boolean ok = verify(x);
+                if (ok || s == SRC_ALARM) { t = x; used = s; break; }
+                Status.put("6.audio.src" + s, "not routed after 700ms -> skipped");
+                x.release();
+                try { Thread.sleep(250); } catch (InterruptedException ignored) { }
+            }
+            if (t != null) break;
+            if (o == 1) Status.put("6.audio.quad", "quad track could not be created -> falling back to stereo");
         }
         if (t == null) return false;
+        if (ch == 4) Status.remove("6.audio.quad");
         bufFrames = burst * 2;
         t.setBufferSizeInFrames(bufFrames);
         lastUnder = 0;
         track = t;
         usedSrc = used;
         appliedSrc = want;
+        appliedOut = wantOut;
         Status.remove("6.audio.src1");
         Status.remove("6.audio.src2");
         lastPump = System.nanoTime();
-        trackInfo = "src=" + (used == SRC_BEACON ? "BEACON(experimental)" : "ALARM(+volume compensation)") + " perfMode=" + t.getPerformanceMode()
+        trackInfo = "out=" + (ch == 4 ? "QUAD" : "STEREO") + " src=" + (used == SRC_BEACON ? "BEACON(experimental)" : "ALARM(+volume compensation)") + " perfMode=" + t.getPerformanceMode()
                 + " " + trackInfo;
         Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
         return true;
@@ -445,6 +517,7 @@ final class HapticEngine implements Runnable {
         track = null;
         playing = false;
         appliedSrc = -1;
+        appliedOut = -1;
     }
 
     private void pump() {
@@ -506,18 +579,36 @@ final class HapticEngine implements Runnable {
         float alpha = lab ? 1f : (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
         float g = cfg.gain * REF * comp;
         boolean anti = cfg.phase == 1;
+        int qm = cfg.quadMode;
         for (int i = 0; i < n; i++) {
             lp1 += alpha * (mix[i] * g - lp1);
             lp2 += alpha * (lp1 - lp2);
             short s = (short) (Synth.limit(lp2) * 32767f);
-            short l = s, r = anti ? (short) -s : s;
-            if (lab) { l = labM == 1 ? 0 : s; r = labM == 0 ? 0 : (labM == 3 ? (short) -s : s); }
-            pcm[2 * i] = l;
-            pcm[2 * i + 1] = r;
+            short ns = (short) -s;
+            if (ch == 2) {
+                short l = s, r = anti ? ns : s;
+                if (lab) { l = labM == 1 ? 0 : s; r = labM == 0 ? 0 : (labM == 3 ? ns : s); }
+                pcm[2 * i] = l;
+                pcm[2 * i + 1] = r;
+            } else {
+                short fl, fr, bl, br;
+                if (lab) {
+                    short l = labM == 1 ? 0 : s, r = labM == 0 ? 0 : (labM == 3 ? ns : s);
+                    fl = l; bl = l; fr = r; br = r;
+                } else {
+                    switch (qm) {
+                        case 1: fl = s; bl = s; fr = ns; br = ns; break;     // left/right anti-phase
+                        case 2: fl = s; fr = s; bl = ns; br = ns; break;     // front/back anti-phase
+                        case 3: fl = s; br = s; fr = ns; bl = ns; break;     // diagonal anti-phase (rocking)
+                        default: fl = s; fr = s; bl = s; br = s; break;      // all in phase (max net push)
+                    }
+                }
+                pcm[4 * i] = fl; pcm[4 * i + 1] = fr; pcm[4 * i + 2] = bl; pcm[4 * i + 3] = br;
+            }
         }
-        int w = track.write(pcm, 0, n * 2, AudioTrack.WRITE_BLOCKING);
+        int w = track.write(pcm, 0, n * ch, AudioTrack.WRITE_BLOCKING);
         if (w < 0) throw new IllegalStateException("AudioTrack.write=" + w);
-        framesWritten += w / 2;
+        framesWritten += w / ch;
         lastPump = System.nanoTime();
 
         long now = System.nanoTime();
