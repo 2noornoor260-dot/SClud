@@ -14,6 +14,16 @@
             android:value="Emulates a vibration motor through the speakers (system-wide, Android 17)" />
         <meta-data android:name="xposedminversion" android:value="93" />
         <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+        <service
+            android:name=".QsTileService"
+            android:exported="true"
+            android:label="اهتزاز السماعات"
+            android:icon="@android:drawable/ic_lock_silent_mode_off"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

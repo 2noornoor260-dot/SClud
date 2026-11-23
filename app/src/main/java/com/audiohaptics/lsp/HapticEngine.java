@@ -4,7 +4,11 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.database.ContentObserver;
+import android.hardware.Sensor;
+import android.hardware.SensorManager;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -13,18 +17,26 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PowerManager;
 import android.os.Process;
+import android.provider.Settings;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Low-latency speaker haptics engine.
- * A LOW_LATENCY AudioTrack is kept running ("warm") and written one HAL burst at a time, so a request is mixed into
- * the very next burst. Output: low-pass -> soft limiter -> stereo (optionally anti-phase to cancel radiated sound).
- * Strength is our own digital gain; with the fixed-volume (BEACON) source it does not depend on any system volume.
+ * Speaker haptics engine.
+ *
+ * Routing safety: the audio track exists ONLY while haptics are really active. It is released (not just paused) when
+ * the master switch is off, the ringer is silent, a call is in progress, or any external audio device (AirPods,
+ * bluetooth, wired, USB, HDMI) is connected. An always-open "sonification" stream was what made the audio policy move
+ * media from the earbuds to the tablet speaker.
+ *
+ * Output: touch bus + alert bus -> low-pass -> soft limiter -> 4 channels with per-channel polarity (or stereo fallback).
  */
 final class HapticEngine implements Runnable {
     interface StateListener { void onState(boolean vibrating); }
@@ -33,6 +45,8 @@ final class HapticEngine implements Runnable {
     static final float REF = 0.5f;                       // digital peak at 100% strength
     private static final long KEEP_WARM_NS = 4_000_000_000L;
     private static final int SRC_BEACON = 1, SRC_ALARM = 2;
+    private static final int M_ACTIVE = 0, M_OFF = 1, M_SILENT = 2, M_EXTERNAL = 3, M_CALL = 4;
+    private static final String[] M_NAMES = {"active", "off", "silent", "external-audio", "call"};
 
     static final class Voice {
         final float[] d; final float g; final int delay; long start;
@@ -49,34 +63,26 @@ final class HapticEngine implements Runnable {
     private final AtomicBoolean vibState = new AtomicBoolean(false);
 
     private volatile boolean started, cancelPending;
-    private volatile boolean screenOn = true, silent;
+    private volatile boolean screenOn = true, silent, external, inCall, calBusy, calCancel, calRunning;
     private volatile long warmUntil, vibratingUntil, susEnd;
     private volatile float susAmp = 1f;
     volatile float currentAmp = 1f;
+    private volatile long lastPump = System.nanoTime();
+    private volatile float comp = 1f;
 
     private float susCur, lp1, lp2;
-    private double susPh;
+    private double susPh, calPh;
+    private float calComp = 1f;
 
     private Thread thread;
     private Context ctx;
     private AudioTrack track;
-    private int burst = 240, bufFrames, lastUnder, appliedSrc = -1, appliedOut = -1, ch = 2;
-    private boolean playing;
-    private long framesWritten, lastTune;
-    private float[] mix = new float[240];
+    private int burst = 240, bufFrames, lastUnder, appliedOut = -1, ch = 2, usedSrc, stalls;
+    private boolean playing, receiversOk, observerOk, callbackOk;
+    private long framesWritten, lastTune, lastAlive, lastCal = Long.MIN_VALUE;
+    private float[] mix = new float[240], mixA = new float[240];
     private short[] pcm = new short[480];
     private String trackInfo = "not created", lastState = "";
-    private volatile long lastPump = System.nanoTime();
-    private volatile float comp = 1f;          // keeps strength constant when the ALARM source is used
-    private int usedSrc, stalls;
-    private boolean receiversOk;
-    private volatile boolean quadBusy;
-    private static final double SWEEP_S = 16.0;
-    private volatile boolean sweepActive;
-    private long sweepStart, lastSweepStatus, lastSweep = Long.MIN_VALUE;
-    private double sweepPh, sweepDur = 16.0;
-    private volatile int labF, labM;
-    private long lastAlive;
 
     HapticEngine(StateListener l) {
         listener = l;
@@ -122,7 +128,7 @@ final class HapticEngine implements Runnable {
 
     void sustained(long ms) {
         busy(ms);
-        if (!enabledNow()) return;
+        if (!canPlay()) return;
         susEnd = System.nanoTime() + ms * 1_000_000L;
         susAmp = currentAmp;
         wake();
@@ -142,11 +148,29 @@ final class HapticEngine implements Runnable {
     }
 
     String status() {
-        return "engine=" + (started ? "running" : "stopped") + " playing=" + playing + " burst=" + burst
-                + " buf=" + bufFrames + " " + trackInfo;
+        return "engine=" + (started ? "running" : "stopped") + " mode=" + M_NAMES[modeCode()] + " playing=" + playing
+                + " burst=" + burst + " buf=" + bufFrames + " " + trackInfo;
     }
 
-    // ------------------------------------------------------------------ internals
+    // ------------------------------------------------------------------ state
+
+    private int modeCode() {
+        if (!cfg.enabled) return M_OFF;
+        if (inCall) return M_CALL;
+        if (cfg.muteOnSilent && silent) return M_SILENT;
+        if (cfg.offWithExternal && external) return M_EXTERNAL;
+        return M_ACTIVE;
+    }
+
+    private boolean canPlay() { return modeCode() == M_ACTIVE && !calBusy; }
+
+    private final Runnable endCheck = new Runnable() {
+        @Override public void run() {
+            long left = vibratingUntil - System.nanoTime();
+            if (left > 0) { cb.postDelayed(this, left / 1_000_000L + 2); return; }
+            if (vibState.getAndSet(false)) notifyState(false);
+        }
+    };
 
     /** If the engine stops consuming audio (blocked write), releasing the track from here unblocks and re-inits it. */
     private final Runnable watchdog = new Runnable() {
@@ -164,118 +188,12 @@ final class HapticEngine implements Runnable {
         }
     };
 
-    private void updateComp(Context c) {
-        if (usedSrc != SRC_ALARM) { comp = 1f; return; }
-        try {
-            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
-            int idx = am.getStreamVolume(AudioManager.STREAM_ALARM);
-            int max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM);
-            float cur = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, idx, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
-            float top = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, max, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
-            comp = Config.clamp((float) Math.pow(10, (top - cur) / 20.0), 1f, 4f);
-        } catch (Throwable e) { comp = 1f; }
-    }
-
-    private void handleSweep() {
-        long id = cfg.sweep;
-        if (lastSweep == Long.MIN_VALUE) { lastSweep = id; return; }     // never start a stale sweep after a reboot
-        if (id == lastSweep) return;
-        lastSweep = id;
-        if (id > 0 && enabledNow() && cfg.labFreq > 0 && cfg.labMode >= 4) {
-            quadLab(cfg.labMode, cfg.labFreq);
-            return;
-        }
-        if (id > 0 && enabledNow()) {
-            labF = cfg.labFreq;
-            labM = cfg.labMode;
-            sweepDur = labF > 0 ? 4.0 : SWEEP_S;
-            sweepStart = System.nanoTime();
-            sweepPh = 0;
-            sweepActive = true;
-            wake();
-        } else {
-            sweepActive = false;
-            Status.put("10.sweep", "stopped");
-        }
-    }
-
-    /**
-     * 4-channel (FL, FR, BL, BR) test track: modes 4..7 = one channel only, 8 = all in phase, 9 = diagonal anti-phase.
-     * Goes through the multichannel (direct) output if the policy accepts it; reports what the system actually did.
-     */
-    private void quadLab(final int mode, final int freq) {
-        if (quadBusy) return;
-        quadBusy = true;
-        new Thread(() -> {
-            AudioTrack t = null;
-            try {
-                Context c = ctx();
-                AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
-                AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SR).setChannelMask(AudioFormat.CHANNEL_OUT_QUAD).build();
-                AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).setFlags(0x40 | 0x80).build();
-                int min = AudioTrack.getMinBufferSize(SR, AudioFormat.CHANNEL_OUT_QUAD, AudioFormat.ENCODING_PCM_16BIT);
-                t = new AudioTrack.Builder().setAudioAttributes(attrs).setAudioFormat(fmt)
-                        .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(min, SR / 5 * 8)).build();
-                setPreferred(t, am);
-                final AudioTrack tt = t;
-                cb.postDelayed(() -> { try { tt.release(); } catch (Throwable ignored) { } }, 9000);
-                t.play();
-                final int chunk = 960;
-                short[] buf = new short[4 * chunk];
-                double ph = 0, w = 2 * Math.PI * freq / SR;
-                float amp = 0.4f * Config.clamp(cfg.gain, 0.3f, 2f);
-                AudioDeviceInfo d = null;
-                int total = SR * 4;
-                for (int pos = 0; pos < total; pos += chunk) {
-                    for (int i = 0; i < chunk; i++) {
-                        double te = (pos + i) / (double) SR;
-                        double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, 4.0 - te) / 0.05));
-                        short x = (short) (amp * ramp * Math.sin(ph) * 32767.0);
-                        short y = (short) -x;
-                        ph += w;
-                        short fl = 0, fr = 0, bl = 0, br = 0;
-                        switch (mode) {
-                            case 4: fl = x; break;
-                            case 5: fr = x; break;
-                            case 6: bl = x; break;
-                            case 7: br = x; break;
-                            case 8: fl = fr = bl = br = x; break;
-                            default: fl = x; br = x; fr = y; bl = y; break;
-                        }
-                        buf[4 * i] = fl; buf[4 * i + 1] = fr; buf[4 * i + 2] = bl; buf[4 * i + 3] = br;
-                    }
-                    t.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
-                    if (pos == 0) d = t.getRoutedDevice();
-                }
-                Status.put("11.quad", "ok mode=" + mode + " f=" + freq + " channels=" + t.getChannelCount()
-                        + " perfMode=" + t.getPerformanceMode() + " routed=" + (d == null ? "none" : "type" + d.getType()));
-            } catch (Throwable e) {
-                Status.put("11.quad", "FAILED mode=" + mode + " " + e);
-            } finally {
-                try { if (t != null) t.release(); } catch (Throwable ignored) { }
-                quadBusy = false;
-            }
-        }, "AudioHaptics-quadlab").start();
-    }
-
-    private boolean enabledNow() { return cfg.enabled && !(cfg.muteOnSilent && silent); }
-
-    private final Runnable endCheck = new Runnable() {
-        @Override public void run() {
-            long left = vibratingUntil - System.nanoTime();
-            if (left > 0) { cb.postDelayed(this, left / 1_000_000L + 2); return; }
-            if (vibState.getAndSet(false)) notifyState(false);
-        }
-    };
-
     private void notifyState(boolean v) {
         try { listener.onState(v); } catch (Throwable t) { L.e("state", t); }
     }
 
     private void addPulse(float[] w, float gain, int delayMs) {
-        if (w == null || w.length == 0 || !enabledNow()) return;
+        if (w == null || w.length == 0 || !canPlay()) return;
         inbox.add(new Voice(w, gain, (int) (delayMs * (SR / 1000L))));
         wake();
     }
@@ -293,31 +211,62 @@ final class HapticEngine implements Runnable {
         return ctx;
     }
 
-    /** Registered lazily and retried every second: AudioService may not exist yet when the engine first starts. */
-    private void ensureReceivers(Context c) {
-        if (receiversOk || c == null) return;
-        try {
-            IntentFilter f = new IntentFilter();
-            f.addAction(Intent.ACTION_SCREEN_ON);
-            f.addAction(Intent.ACTION_SCREEN_OFF);
-            f.addAction(AudioManager.RINGER_MODE_CHANGED_ACTION);
-            c.registerReceiver(new BroadcastReceiver() {
-                @Override public void onReceive(Context context, Intent intent) {
-                    String a = intent.getAction();
-                    if (Intent.ACTION_SCREEN_ON.equals(a)) { screenOn = true; wake(); }
-                    else if (Intent.ACTION_SCREEN_OFF.equals(a)) screenOn = false;
-                    else if (AudioManager.RINGER_MODE_CHANGED_ACTION.equals(a)) {
-                        silent = intent.getIntExtra(AudioManager.EXTRA_RINGER_MODE, AudioManager.RINGER_MODE_NORMAL)
-                                == AudioManager.RINGER_MODE_SILENT;
-                        if (silent) off();
-                    }
-                }
-            }, f, null, cb);
-            receiversOk = true;
-        } catch (Throwable e) { L.e("receivers (will retry)", e); }
+    private static boolean isExternalType(int t) {
+        switch (t) {
+            case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12: case 13:
+            case 22: case 23: case 26: case 27: case 29: case 30:
+                return true;
+            default:
+                return false;
+        }
     }
 
-    /** Polls the real state once a second as a safety net next to the broadcasts. */
+    /** Registered lazily and retried every second: services may not exist yet when the engine first starts. */
+    private void ensureHooks(final Context c) {
+        if (c == null) return;
+        if (!receiversOk) {
+            try {
+                IntentFilter f = new IntentFilter();
+                f.addAction(Intent.ACTION_SCREEN_ON);
+                f.addAction(Intent.ACTION_SCREEN_OFF);
+                f.addAction(AudioManager.RINGER_MODE_CHANGED_ACTION);
+                c.registerReceiver(new BroadcastReceiver() {
+                    @Override public void onReceive(Context context, Intent intent) {
+                        String a = intent.getAction();
+                        if (Intent.ACTION_SCREEN_ON.equals(a)) { screenOn = true; wake(); }
+                        else if (Intent.ACTION_SCREEN_OFF.equals(a)) screenOn = false;
+                        else pollState(c);
+                    }
+                }, f, null, cb);
+                receiversOk = true;
+            } catch (Throwable e) { L.e("receivers (will retry)", e); }
+        }
+        if (!observerOk) {
+            try {
+                c.getContentResolver().registerContentObserver(Settings.Global.getUriFor(Config.KEY), false,
+                        new ContentObserver(cb) {
+                            @Override public void onChange(boolean selfChange) {
+                                cfg.refresh(c);
+                                handleCommands();
+                                wake();
+                            }
+                        });
+                observerOk = true;
+            } catch (Throwable e) { L.e("observer (will retry)", e); }
+        }
+        if (!callbackOk) {
+            try {
+                AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                am.registerAudioDeviceCallback(new AudioDeviceCallback() {
+                    @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { pollState(c); wake(); }
+                    @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { pollState(c); wake(); }
+                }, cb);
+                callbackOk = true;
+            } catch (Throwable e) { L.e("device callback (will retry)", e); }
+        }
+    }
+
+    /** Reads the real state (also polled every second as a safety net next to the callbacks). */
     private void pollState(Context c) {
         if (c == null) return;
         try {
@@ -326,12 +275,37 @@ final class HapticEngine implements Runnable {
         } catch (Throwable ignored) { }
         try {
             AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
-            if (am != null) {
-                boolean s = am.getRingerMode() == AudioManager.RINGER_MODE_SILENT;
-                if (s && !silent) off();
-                silent = s;
+            if (am == null) return;
+            boolean s = am.getRingerMode() == AudioManager.RINGER_MODE_SILENT;
+            if (s && !silent) off();
+            silent = s;
+            inCall = am.getMode() != AudioManager.MODE_NORMAL;
+            boolean ext = false;
+            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (isExternalType(d.getType())) { ext = true; break; }
             }
+            external = ext;
         } catch (Throwable ignored) { }
+    }
+
+    private synchronized void handleCommands() {
+        long id = cfg.cal;
+        if (lastCal == Long.MIN_VALUE) { lastCal = id; return; }   // never start a stale command after a reboot
+        if (id == lastCal) return;
+        lastCal = id;
+        if (id > 0) startCalibration(); else calCancel = true;
+    }
+
+    private void reportState() {
+        String st = "mode=" + M_NAMES[modeCode()] + " enabled=" + cfg.enabled + " silent=" + silent + " external=" + external
+                + " call=" + inCall + " out=" + (cfg.fastStereo ? "stereo" : "quad") + " touch=" + cfg.gain
+                + " alerts=" + cfg.alertGain + " tone=" + cfg.tone + " soft=" + cfg.soft + " punch=" + cfg.punch
+                + " signs=" + Arrays.toString(cfg.signs);
+        if (!st.equals(lastState)) {
+            lastState = st;
+            Status.put("0.mode", M_NAMES[modeCode()]);
+            Status.put("8.state", st);
+        }
     }
 
     private void boostThread() {
@@ -342,12 +316,18 @@ final class HapticEngine implements Runnable {
         } catch (Throwable ignored) { }
     }
 
-    private void reportState() {
-        String st = "enabled=" + cfg.enabled + " muteOnSilent=" + cfg.muteOnSilent + " silent=" + silent
-                + " active=" + enabledNow() + " phase=" + (cfg.phase == 1 ? "anti" : "in") + " gain=" + cfg.gain
-                + " tone=" + cfg.tone + " soft=" + cfg.soft;
-        if (!st.equals(lastState)) { lastState = st; Status.put("8.state", st); }
+    private float alarmComp(Context c) {
+        try {
+            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+            int idx = am.getStreamVolume(AudioManager.STREAM_ALARM);
+            int max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+            float cur = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, idx, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
+            float top = am.getStreamVolumeDb(AudioManager.STREAM_ALARM, max, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER);
+            return Config.clamp((float) Math.pow(10, (top - cur) / 20.0), 1f, 4f);
+        } catch (Throwable e) { return 1f; }
     }
+
+    // ------------------------------------------------------------------ main loop
 
     @Override public void run() {
         boostThread();
@@ -356,26 +336,30 @@ final class HapticEngine implements Runnable {
             try {
                 long now = System.nanoTime();
                 if (now - lastCfg > 1_000_000_000L) {
-                    cfg.refresh(ctx()); lastCfg = now;
-                    ensureReceivers(ctx); pollState(ctx);
-                    handleSweep();
+                    lastCfg = now;
+                    Context c = ctx();
+                    cfg.refresh(c);
+                    ensureHooks(c);
+                    pollState(c);
+                    handleCommands();
                     reportState();
-                    if (ctx != null && track != null) updateComp(ctx);
+                    if (c != null && track != null) comp = usedSrc == SRC_ALARM ? alarmComp(c) : 1f;
                     if (now - lastAlive > 5_000_000_000L) {
                         lastAlive = now;
-                        Status.put("9.alive", new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(new java.util.Date())
-                                + " comp=" + String.format(java.util.Locale.US, "%.2f", comp));
+                        Status.put("9.alive", new java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(new java.util.Date())
+                                + " comp=" + String.format(Locale.US, "%.2f", comp));
                     }
                 }
                 lastPump = Math.max(lastPump, now - 1_000_000_000L);
-                if (!enabledNow()) {
-                    inbox.clear(); voices.clear(); susEnd = 0; susCur = 0; sweepActive = false;
-                    if (playing) stopTrack();
+
+                if (modeCode() != M_ACTIVE) {                // nothing may stay open while inactive
+                    inbox.clear(); voices.clear(); susEnd = 0; susCur = 0;
+                    if (track != null) releaseTrack();
                     LockSupport.parkNanos(150_000_000L);
                     continue;
                 }
-                if (track != null && (appliedSrc != cfg.src || appliedOut != cfg.out)) releaseTrack();   // source changed in the app
-                boolean work = !inbox.isEmpty() || !voices.isEmpty() || now < susEnd || susCur > 1e-4f || cancelPending || sweepActive;
+                if (track != null && appliedOut != (cfg.fastStereo ? 0 : 1)) releaseTrack();
+                boolean work = !inbox.isEmpty() || !voices.isEmpty() || now < susEnd || susCur > 1e-4f || cancelPending;
                 boolean warm = work || now < warmUntil || cfg.warm == 2 || (cfg.warm == 1 && screenOn);
                 if (!warm) {
                     if (playing) stopTrack();
@@ -401,7 +385,6 @@ final class HapticEngine implements Runnable {
             try {
                 AudioAttributes.Builder ab = new AudioAttributes.Builder();
                 if (src == SRC_BEACON) {
-                    // FLAG_BEACON -> "transmitted through speaker" strategy: speaker only, fixed 0 dB volume curve
                     ab.setUsage(AudioAttributes.USAGE_UNKNOWN).setContentType(AudioAttributes.CONTENT_TYPE_UNKNOWN)
                             .setFlags(0x08 | (attempt % 2 == 0 ? 0x80 : 0));
                 } else {
@@ -458,9 +441,9 @@ final class HapticEngine implements Runnable {
             if (p != null) burst = Math.max(48, Integer.parseInt(p));
         } catch (Throwable ignored) { }
         mix = new float[burst];
-        int wantOut = cfg.out;
-        int want = cfg.src;
-        int[] order = want == 1 ? new int[]{SRC_BEACON, SRC_ALARM} : want == 2 ? new int[]{SRC_ALARM} : new int[]{SRC_ALARM, SRC_BEACON};
+        mixA = new float[burst];
+        int wantOut = cfg.fastStereo ? 0 : 1;
+        int[] order = {SRC_ALARM, SRC_BEACON};
         AudioTrack t = null;
         int used = 0;
         for (int o : (wantOut == 1 ? new int[]{1, 0} : new int[]{0})) {
@@ -489,14 +472,14 @@ final class HapticEngine implements Runnable {
         lastUnder = 0;
         track = t;
         usedSrc = used;
-        appliedSrc = want;
         appliedOut = wantOut;
         Status.remove("6.audio.src1");
         Status.remove("6.audio.src2");
         lastPump = System.nanoTime();
-        trackInfo = "out=" + (ch == 4 ? "QUAD" : "STEREO") + " src=" + (used == SRC_BEACON ? "BEACON(experimental)" : "ALARM(+volume compensation)") + " perfMode=" + t.getPerformanceMode()
-                + " " + trackInfo;
-        Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo + " (perfMode 1 = LOW_LATENCY)");
+        comp = used == SRC_ALARM ? alarmComp(c) : 1f;
+        trackInfo = "out=" + (ch == 4 ? "QUAD" : "STEREO") + " src=" + (used == SRC_BEACON ? "BEACON" : "ALARM")
+                + " perfMode=" + t.getPerformanceMode() + " " + trackInfo;
+        Status.put("6.audio", "track ready burst=" + burst + " " + trackInfo);
         return true;
     }
 
@@ -516,7 +499,6 @@ final class HapticEngine implements Runnable {
         try { if (track != null) track.release(); } catch (Throwable ignored) { }
         track = null;
         playing = false;
-        appliedSrc = -1;
         appliedOut = -1;
     }
 
@@ -529,6 +511,7 @@ final class HapticEngine implements Runnable {
             for (int i = voices.size() - 1; i >= 0; i--) if (voices.get(i).start > framesWritten) voices.remove(i);
         }
         Arrays.fill(mix, 0, n, 0f);
+        Arrays.fill(mixA, 0, n, 0f);
         long base = framesWritten;
         for (int a = voices.size() - 1; a >= 0; a--) {
             Voice x = voices.get(a);
@@ -548,62 +531,26 @@ final class HapticEngine implements Runnable {
             for (int i = 0; i < n; i++) {
                 susCur += (target - susCur) * k;
                 susPh += w;
-                mix[i] += susCur * (float) (Math.sin(susPh) + 0.35 * Math.sin(2 * susPh)) / 1.35f;
+                mixA[i] += susCur * (float) (Math.sin(susPh) + 0.35 * Math.sin(2 * susPh)) / 1.35f;
             }
             if (susPh > 1e6) susPh %= 2 * Math.PI;
         }
-        if (sweepActive) {
-            long nowN = System.nanoTime();
-            double el = (nowN - sweepStart) / 1e9;
-            if (el > sweepDur) {
-                sweepActive = false;
-                Status.put("10.sweep", "finished");
-            } else {
-                for (int i = 0; i < n; i++) {
-                    double te = el + i / (double) SR;
-                    double f = labF > 0 ? labF : 50.0 * Math.pow(8.0, Math.min(1.0, te / sweepDur));
-                    sweepPh += 2 * Math.PI * f / SR;
-                    double ramp = Math.max(0.0, Math.min(1.0, Math.min(te, sweepDur - te) / 0.05));
-                    mix[i] += 0.7f * (float) ramp * (float) Math.sin(sweepPh);
-                }
-                if (sweepPh > 1e6) sweepPh %= 2 * Math.PI;
-                if (labF == 0 && nowN - lastSweepStatus > 250_000_000L) {
-                    lastSweepStatus = nowN;
-                    Status.put("10.sweep", "f=" + (int) (50.0 * Math.pow(8.0, el / sweepDur)));
-                }
-            }
-        }
-        // softness: 2-pole low-pass, cutoff 1500 Hz (soft=0) .. 250 Hz (soft=1)
-        double fc = 1500.0 * Math.pow(250.0 / 1500.0, cfg.soft);
-        boolean lab = sweepActive && labF > 0;
-        float alpha = lab ? 1f : (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
-        float g = cfg.gain * REF * comp;
-        boolean anti = cfg.phase == 1;
-        int qm = cfg.quadMode;
+        double fc = 1500.0 * Math.pow(250.0 / 1500.0, cfg.soft);   // softness: 1500 Hz (0) .. 250 Hz (1)
+        float alpha = (float) (1 - Math.exp(-2 * Math.PI * fc / SR));
+        float gT = cfg.gain * REF * comp, gA = cfg.alertGain * REF * comp;
+        float[] sg = cfg.signs;
         for (int i = 0; i < n; i++) {
-            lp1 += alpha * (mix[i] * g - lp1);
+            lp1 += alpha * (mix[i] * gT + mixA[i] * gA - lp1);
             lp2 += alpha * (lp1 - lp2);
-            short s = (short) (Synth.limit(lp2) * 32767f);
-            short ns = (short) -s;
+            float y = Synth.limit(lp2) * 32767f;
             if (ch == 2) {
-                short l = s, r = anti ? ns : s;
-                if (lab) { l = labM == 1 ? 0 : s; r = labM == 0 ? 0 : (labM == 3 ? ns : s); }
-                pcm[2 * i] = l;
-                pcm[2 * i + 1] = r;
+                pcm[2 * i] = (short) (y * sg[0]);
+                pcm[2 * i + 1] = (short) (y * sg[1]);
             } else {
-                short fl, fr, bl, br;
-                if (lab) {
-                    short l = labM == 1 ? 0 : s, r = labM == 0 ? 0 : (labM == 3 ? ns : s);
-                    fl = l; bl = l; fr = r; br = r;
-                } else {
-                    switch (qm) {
-                        case 1: fl = s; bl = s; fr = ns; br = ns; break;     // left/right anti-phase
-                        case 2: fl = s; fr = s; bl = ns; br = ns; break;     // front/back anti-phase
-                        case 3: fl = s; br = s; fr = ns; bl = ns; break;     // diagonal anti-phase (rocking)
-                        default: fl = s; fr = s; bl = s; br = s; break;      // all in phase (max net push)
-                    }
-                }
-                pcm[4 * i] = fl; pcm[4 * i + 1] = fr; pcm[4 * i + 2] = bl; pcm[4 * i + 3] = br;
+                pcm[4 * i] = (short) (y * sg[0]);
+                pcm[4 * i + 1] = (short) (y * sg[1]);
+                pcm[4 * i + 2] = (short) (y * sg[2]);
+                pcm[4 * i + 3] = (short) (y * sg[3]);
             }
         }
         int w = track.write(pcm, 0, n * ch, AudioTrack.WRITE_BLOCKING);
@@ -621,6 +568,126 @@ final class HapticEngine implements Runnable {
                 L.i("underruns " + u + " -> buffer " + bufFrames + " frames");
             }
             lastUnder = u;
+        }
+    }
+
+    // ------------------------------------------------------------------ auto-tune (measured with the accelerometer)
+
+    private void startCalibration() {
+        if (calRunning) return;
+        if (modeCode() != M_ACTIVE) {
+            Status.put("12.cal", "ABORT: haptics are not active now (" + M_NAMES[modeCode()] + ")");
+            return;
+        }
+        calRunning = true;
+        calCancel = false;
+        calBusy = true;
+        new Thread(this::calibrate, "AudioHaptics-cal").start();
+    }
+
+    private double calSegment(AudioTrack t, float[] sg, double freq, double sec, double skip, Meter m) {
+        final int chunk = 480;
+        short[] buf = new short[4 * chunk];
+        long frames = (long) (sec * SR);
+        double w = 2 * Math.PI * freq / SR;
+        boolean reset = false, snapped = false;
+        double snap = 0;
+        float amp = (float) Math.min(0.9, 0.5 * calComp);
+        for (long pos = 0; pos < frames && !calCancel; pos += chunk) {
+            double t0 = pos / (double) SR;
+            if (!reset && t0 >= skip) { m.reset(); reset = true; }
+            if (!snapped && t0 >= sec - 0.06) { snap = m.rms(); snapped = true; }
+            for (int i = 0; i < chunk; i++) {
+                double te = (pos + i) / (double) SR;
+                double ramp = Math.max(0, Math.min(1, Math.min(te, sec - te) / 0.03));
+                calPh += w;
+                short x = (short) (amp * ramp * Math.sin(calPh) * 32767.0);
+                for (int k = 0; k < 4; k++) buf[4 * i + k] = (short) (x * sg[k]);
+            }
+            int wr = t.write(buf, 0, buf.length, AudioTrack.WRITE_BLOCKING);
+            if (wr < 0) throw new IllegalStateException("calibration write=" + wr);
+        }
+        if (!snapped) snap = m.rms();
+        if (calPh > 1e6) calPh %= 2 * Math.PI;
+        return snap;
+    }
+
+    private void calibrate() {
+        AudioTrack t = null;
+        SensorManager sm = null;
+        Meter meter = new Meter();
+        try {
+            Context c = ctx();
+            AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+            sm = (SensorManager) c.getSystemService(Context.SENSOR_SERVICE);
+            Sensor acc = sm == null ? null : sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            if (acc == null) { Status.put("12.cal", "ERROR: no accelerometer"); return; }
+            if (!sm.registerListener(meter, acc, 2500, cb)) sm.registerListener(meter, acc, SensorManager.SENSOR_DELAY_FASTEST, cb);
+            calComp = alarmComp(c);
+
+            AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SR).setChannelMask(AudioFormat.CHANNEL_OUT_QUAD).build();
+            AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).setFlags(0x40 | 0x80).build();
+            int min = AudioTrack.getMinBufferSize(SR, AudioFormat.CHANNEL_OUT_QUAD, AudioFormat.ENCODING_PCM_16BIT);
+            t = new AudioTrack.Builder().setAudioAttributes(attrs).setAudioFormat(fmt)
+                    .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(min, SR / 10 * 8)).build();
+            setPreferred(t, am);
+            t.play();
+
+            Status.put("12.cal", "1/3 measuring the noise floor... keep the tablet still on a table");
+            double base = calSegment(t, new float[]{0, 0, 0, 0}, 100, 1.2, 0.4, meter);
+
+            double[] net = new double[8];
+            int best = 0;
+            for (int p = 0; p < 8 && !calCancel; p++) {
+                float[] sg = {1f, (p & 1) != 0 ? -1f : 1f, (p & 2) != 0 ? -1f : 1f, (p & 4) != 0 ? -1f : 1f};
+                Status.put("12.cal", "2/3 testing speaker combinations " + (p + 1) + "/8");
+                double r = calSegment(t, sg, 150, 1.6, 0.6, meter);
+                net[p] = Math.sqrt(Math.max(0, r * r - base * base));
+                if (net[p] > net[best]) best = p;
+            }
+            if (calCancel) { Status.put("12.cal", "CANCELLED"); return; }
+            if (net[best] < 2.5) {
+                Status.put("12.cal", "ERROR: signal too weak (" + String.format(Locale.US, "%.1f", net[best])
+                        + " mg). Put the tablet flat on a firm table and try again");
+                return;
+            }
+            float[] bs = {1f, (best & 1) != 0 ? -1f : 1f, (best & 2) != 0 ? -1f : 1f, (best & 4) != 0 ? -1f : 1f};
+
+            double[] fnet = new double[13];
+            int fi = 0;
+            for (int f = 70; f <= 190 && !calCancel; f += 10) {
+                Status.put("12.cal", "3/3 finding the strongest frequency: " + f + " Hz");
+                double r = calSegment(t, bs, f, 0.8, 0.4, meter);
+                fnet[fi++] = Math.sqrt(Math.max(0, r * r - base * base));
+            }
+            if (calCancel) { Status.put("12.cal", "CANCELLED"); return; }
+            int bi = 0;
+            double bv = -1;
+            for (int i = 0; i < 13; i++) {
+                double s = 0.25 * fnet[Math.max(0, i - 1)] + 0.5 * fnet[i] + 0.25 * fnet[Math.min(12, i + 1)];
+                if (s > bv) { bv = s; bi = i; }
+            }
+            int bestF = 70 + 10 * bi;
+            float toneNew = Config.clamp(bestF / 150f, 0.5f, 1.3f);
+
+            Map<String, String> up = new HashMap<>();
+            up.put("qs", String.format(Locale.US, "%.1f,%.1f,%.1f,%.1f", bs[0], bs[1], bs[2], bs[3]));
+            up.put("t", String.format(Locale.US, "%.2f", toneNew));
+            Config.write(c, up);
+            double ratio = net[best] / Math.max(0.1, net[5]);
+            Status.put("12.cal", String.format(Locale.US,
+                    "DONE: polarity=%.0f,%.0f,%.0f,%.0f frequency=%d Hz vibration=%.1f mg (x%.1f vs default)",
+                    bs[0], bs[1], bs[2], bs[3], bestF, net[best], ratio));
+        } catch (Throwable e) {
+            Status.put("12.cal", "ERROR: " + e);
+            L.e("calibration", e);
+        } finally {
+            try { if (sm != null) sm.unregisterListener(meter); } catch (Throwable ignored) { }
+            try { if (t != null) t.release(); } catch (Throwable ignored) { }
+            calBusy = false;
+            calRunning = false;
         }
     }
 }

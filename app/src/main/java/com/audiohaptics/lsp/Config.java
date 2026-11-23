@@ -3,49 +3,86 @@ package com.audiohaptics.lsp;
 import android.content.Context;
 import android.provider.Settings;
 
-/** Settings written by the UI app into Settings.Global ("e=1;m=1;p=1;k=0;g=1.00;t=1.00;s=0.60;w=1"). */
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/** Settings shared between the app (writer) and system_server (reader) through Settings.Global. */
 final class Config {
-    static final String KEY = "audio_haptics_cfg";
-    volatile boolean enabled = true;      // e: master switch
-    volatile boolean muteOnSilent = true; // m: no haptics while the ringer is on silent
-    volatile int phase = 1;               // p: 0 = in-phase (strong), 1 = anti-phase (quiet, dipole cancellation)
-    volatile int src = 0;                 // k: 0 = auto, 1 = fixed-volume speaker (BEACON), 2 = alarm stream
-    volatile float gain = 1.0f;           // g: strength (own control, 0..3)
-    volatile float tone = 1.0f;           // t: carrier frequency multiplier
-    volatile float soft = 0.6f;           // s: softness (low-pass), 0..1
-    volatile int out = 0;                 // o: 0 = stereo (fast path), 1 = quad (4 channels, experimental)
-    volatile int quadMode = 0;            // q: 0 all in phase, 1 left/right anti, 2 front/back anti, 3 diagonal anti
-    volatile float punch = 1.8f;          // u: click length/energy multiplier
-    volatile int labMode = 2, labFreq = 0; // lm / lf: speaker-lab tone (0 L only, 1 R only, 2 both, 3 anti-phase)
-    volatile long sweep = 0;              // x: frequency-calibration sweep command id (0 = stop)
-    volatile int warm = 1;                // w: 0 on demand, 1 while screen on, 2 always
+    static final String KEY = "audio_haptics_cfg2";
+
+    volatile boolean enabled = true;          // e
+    volatile boolean muteOnSilent = true;     // m
+    volatile boolean offWithExternal = true;  // xo: stop while headphones / bluetooth / usb audio are connected
+    volatile boolean fastStereo = false;      // f: stereo fast path instead of the 4-channel output
+    volatile float gain = 1.0f;               // g: touch & typing strength
+    volatile float alertGain = 1.0f;          // a: alerts & continuous vibration strength
+    volatile float tone = 1.0f;               // t: carrier multiplier (set by auto-tune)
+    volatile float soft = 0.6f;               // s
+    volatile float punch = 1.8f;              // u: click length / energy
+    volatile int warm = 1;                    // w
+    // qs: per-channel polarity FL,FR,BL,BR. Measured on SM-T505N: the left pair is inverted relative to the right pair.
+    volatile float[] signs = {1f, -1f, 1f, -1f};
+    volatile long cal = 0;                    // c: auto-tune command id
 
     void refresh(Context c) {
         if (c == null) return;
+        Map<String, String> m = parse(read(c));
+        if (m.isEmpty()) return;
         try {
-            String s = Settings.Global.getString(c.getContentResolver(), KEY);
-            if (s == null) return;
-            for (String kv : s.split(";")) {
-                String[] p = kv.split("=");
-                if (p.length != 2) continue;
-                switch (p[0]) {
-                    case "e": enabled = !p[1].equals("0"); break;
-                    case "m": muteOnSilent = !p[1].equals("0"); break;
-                    case "p": phase = Math.max(0, Math.min(1, Integer.parseInt(p[1]))); break;
-                    case "k": src = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
-                    case "g": gain = clamp(Float.parseFloat(p[1]), 0f, 3f); break;
-                    case "t": tone = clamp(Float.parseFloat(p[1]), 0.4f, 3f); break;
-                    case "x": sweep = Long.parseLong(p[1]); break;
-                    case "o": out = Math.max(0, Math.min(1, Integer.parseInt(p[1]))); break;
-                    case "q": quadMode = Math.max(0, Math.min(3, Integer.parseInt(p[1]))); break;
-                    case "u": punch = clamp(Float.parseFloat(p[1]), 0.5f, 3.5f); break;
-                    case "lm": labMode = Math.max(0, Math.min(9, Integer.parseInt(p[1]))); break;
-                    case "lf": labFreq = Math.max(0, Math.min(8000, Integer.parseInt(p[1]))); break;
-                    case "s": soft = clamp(Float.parseFloat(p[1]), 0f, 1f); break;
-                    case "w": warm = Math.max(0, Math.min(2, Integer.parseInt(p[1]))); break;
+            for (Map.Entry<String, String> e : m.entrySet()) {
+                String v = e.getValue();
+                switch (e.getKey()) {
+                    case "e": enabled = !v.equals("0"); break;
+                    case "m": muteOnSilent = !v.equals("0"); break;
+                    case "xo": offWithExternal = !v.equals("0"); break;
+                    case "f": fastStereo = v.equals("1"); break;
+                    case "g": gain = clamp(Float.parseFloat(v), 0f, 2.5f); break;
+                    case "a": alertGain = clamp(Float.parseFloat(v), 0f, 2.5f); break;
+                    case "t": tone = clamp(Float.parseFloat(v), 0.4f, 3f); break;
+                    case "s": soft = clamp(Float.parseFloat(v), 0f, 1f); break;
+                    case "u": punch = clamp(Float.parseFloat(v), 0.5f, 3.5f); break;
+                    case "w": warm = Math.max(0, Math.min(2, Integer.parseInt(v))); break;
+                    case "c": cal = Long.parseLong(v); break;
+                    case "qs": {
+                        String[] p = v.split(",");
+                        if (p.length == 4) {
+                            float[] s = new float[4];
+                            for (int i = 0; i < 4; i++) s[i] = clamp(Float.parseFloat(p[i]), -1f, 1f);
+                            signs = s;
+                        }
+                        break;
+                    }
                 }
             }
         } catch (Throwable ignored) { }
+    }
+
+    static String read(Context c) {
+        try { return Settings.Global.getString(c.getContentResolver(), KEY); } catch (Throwable t) { return null; }
+    }
+
+    static Map<String, String> parse(String s) {
+        LinkedHashMap<String, String> m = new LinkedHashMap<>();
+        if (s == null) return m;
+        for (String kv : s.split(";")) {
+            int i = kv.indexOf('=');
+            if (i > 0) m.put(kv.substring(0, i), kv.substring(i + 1));
+        }
+        return m;
+    }
+
+    /** Merges the updates into the stored string. Returns false when the write is not permitted. */
+    static boolean write(Context c, Map<String, String> updates) {
+        try {
+            Map<String, String> m = parse(read(c));
+            m.putAll(updates);
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> e : m.entrySet()) {
+                if (sb.length() > 0) sb.append(';');
+                sb.append(e.getKey()).append('=').append(e.getValue());
+            }
+            return Settings.Global.putString(c.getContentResolver(), KEY, sb.toString());
+        } catch (Throwable t) { return false; }
     }
 
     static float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
